@@ -1,6 +1,6 @@
 import pysam
 import argparse
-from Bio.Align import PairwiseAligner
+from lib_ssw.pyssw import align_pair
 import statistics as stats
 
 """
@@ -20,6 +20,44 @@ def parse_args():
     args = parser.parse_args()
 
     return args
+
+
+def convert_cigar(cigar):
+    """
+    Converts the CIGAR string to a list of tuples
+    Args:
+        cigar: CIGAR string from pysam record
+
+    Returns:
+        list of tuples
+    """
+    cigar_char = {'M': 0, 'I': 1, 'D': 2, 'N': 3, 'S': 4, 'H': 5, 'P': 6, '=': 7, 'X': 8, 'B': 9}
+    cigartuples = []
+    length = ''
+    for c in cigar:
+        if c.isdigit(): length += c
+        else:
+            cigartuples.append((cigar_char[c], int(length)))
+            length = ''
+
+    return cigartuples
+
+
+def convert_cigartuples(cigartuples):
+    """
+    Converts the CIGAR tuples to a string
+    Args:
+        cigartuples: CIGAR tuples from pysam record
+    
+    Returns:
+        CIGAR string
+    """
+    cigar_char = {0: 'M', 1: 'I', 2: 'D', 3: 'N', 4: 'S', 5: 'H', 6: 'P', 7: '=', 8: 'X', 9: 'B'}
+    cigar = ''
+    for c in cigartuples:
+        cigar += f'{c[1]}{cigar_char[c[0]]}'
+
+    return cigar
 
 
 def parse_cigar(cigar_tuples, read_start, repeat_start, repeat_end):
@@ -49,7 +87,7 @@ def parse_cigar(cigar_tuples, read_start, repeat_start, repeat_end):
     sub_cigar = ''
 
     for c, cigar in enumerate(cigar_tuples):
-        print(cigar[0], cigar[1], qpos, rpos) 
+        # print(cigar, rpos, qpos, start_idx, end_idx, repeat_start, repeat_end, sub_cigar, sep='\t')
         if cigar[0] == 4:
            # soft clipped - these bases are part of the read sequence but do not
            #                affect the reference position.
@@ -57,20 +95,19 @@ def parse_cigar(cigar_tuples, read_start, repeat_start, repeat_end):
 
         elif cigar[0] == 2:     # deletion
             deletion_length = cigar[1]
-
-            for i in range(deletion_length):
-                # iterating over the each deleted base
-                if rpos + i == repeat_start and start_idx == False:
-                    # if the deletion covers the repeat start
-                    start_idx = qpos
-
-                if rpos + i == repeat_end:
-                    # deletion covers the repeat end
+            if start_idx == False and rpos + deletion_length >= repeat_start:
+                start_idx = qpos
+                if rpos + deletion_length >= repeat_end:
                     end_idx = qpos
+                    sub_cigar += f'{repeat_end - repeat_start}D'
+                else: sub_cigar += f'{rpos + deletion_length - repeat_start}D'
+            
+            elif start_idx != False and end_idx == False:
+                if rpos + deletion_length >= repeat_end:
+                    end_idx = qpos
+                    sub_cigar += f'{repeat_end-rpos}D'
+                else: sub_cigar += f'{deletion_length}D'
 
-                if start_idx != False and end_idx == False:
-                    # if the position is within the repeat
-                    sub_cigar += 'D'
             # move the reference position
             rpos += deletion_length
 
@@ -80,45 +117,41 @@ def parse_cigar(cigar_tuples, read_start, repeat_start, repeat_end):
             if rpos == repeat_start and start_idx == False:
                 # if the insert is before the repeat include the sequence within the repeat
                 start_idx = qpos
-            for i in range(insert_length):
-                if start_idx != False and end_idx == False:
-                    # if insert within the repeat
-                    sub_cigar += 'I'
+                sub_cigar += f'{insert_length}I'
+            elif start_idx != False and end_idx == False:
+                sub_cigar += f'{insert_length}I'
+            elif start_idx != False and rpos == repeat_end:
+                sub_cigar += f'{insert_length}I'
+                end_idx = qpos + insert_length
             # move the query position
             qpos += insert_length
 
-        elif cigar[0] == 0 or cigar[0] == 7: # match (both equals & difference)
+        elif cigar[0] == 0 or cigar[0] == 7 or cigar[0] == 8: # match (both equals & difference)
             match_len = cigar[1]
+            ctype = 'X' if cigar[0] == 8 else 'M'
 
-            for i in range(match_len):
-                # iterating over the match positions
-                if rpos + i == repeat_start and start_idx == False:
-                    # if match covers the repeat start
-                    start_idx = qpos + i
+            if start_idx == False and rpos + match_len > repeat_start:
+                start_idx = qpos + (repeat_start - rpos)
+                if rpos + match_len >= repeat_end:
+                    end_idx = qpos + (repeat_end - rpos) 
+                    sub_cigar += f'{repeat_end - repeat_start}{ctype}'
+                else: sub_cigar += f'{rpos + match_len - repeat_start}{ctype}'
+            
+            elif start_idx != False and end_idx == False:
+                if rpos + match_len >= repeat_end:
+                    end_idx = qpos + (repeat_end - rpos)
+                    sub_cigar += f'{repeat_end - rpos}{ctype}'
+                else:
+                    sub_cigar += f'{match_len}{ctype}'
 
-                if rpos + i == repeat_end:
-                    # if match covers the repeat end
-                    end_idx = qpos + i
-
-                if start_idx != False and end_idx == False:
-                    # if match within the repeat
-                    sub_cigar += 'M'
             # move both reference and query positions
             rpos += match_len; qpos += match_len
 
         if rpos > repeat_end:
-            if end_idx == False:
-                # if the end of the repeat is not covered by the read
-                # but the read has moved beyond the repeat
-                end_idx = qpos - (rpos - repeat_end)
             # if position moved beyond repeat
-            return [start_idx, end_idx]
+            return [start_idx, end_idx, sub_cigar]
 
-    if end_idx == False:
-                # if the end of the repeat is not covered by the read
-                # but the read has moved beyond the repeat
-                end_idx = qpos - (rpos - repeat_end)
-    return [start_idx, end_idx]
+    return [start_idx, end_idx, sub_cigar]
 
 
 def extract_reads(bed_file, bam_files, ref_fasta, aln_format):
@@ -141,10 +174,10 @@ def extract_reads(bed_file, bam_files, ref_fasta, aln_format):
             repeat_start = int(line[1]); repeat_end = int(line[2])
             cigar = line[-1]
             motif_len = len(line[3])
+            start_idx = -1; end_idx = -1
 
             if chrom != 'chrX': continue
 
-            reference_repseq = ""
             for bam in bams:
                 # Get the file name
                 bam_id = bam.filename.decode('utf-8').split('.')[0]
@@ -153,36 +186,64 @@ def extract_reads(bed_file, bam_files, ref_fasta, aln_format):
                 reads = bam.fetch(chrom, repeat_start, repeat_end)
                 check = False
                 for read in reads:
-                    if read.reference_start < repeat_start-10 and read.reference_end > repeat_end + 10:
-                        start_idx, end_idx = parse_cigar(read.cigartuples, read.reference_start, repeat_start, repeat_end)
-                        # RD2RP_CIGAR, RF2RD2RP_CIGAR, tags = convert_CIGAR(cigar, sub_cigar, motif, motif_len, read_repseq)
 
-                        read_data.append([f"{chrom}:{repeat_start}-{repeat_end}", read.query_name, start_idx, end_idx])
+                    if read.reference_start < repeat_start-10 and read.reference_end > repeat_end + 10:
+                        start_idx, end_idx, sub_cigar = parse_cigar(read.cigartuples, read.reference_start, repeat_start, repeat_end)
 
                     else:
-                        if read.cigartuples[0][0] == 4:
-                            # soft clipped - these bases are part of the read sequence but do not
-                            #                affect the reference position.
-                            soft_clipped = read.query_sequence[:read.cigartuples[0][1]]
-                            sclip_len = read.cigartuples[0][1]
-                            if read.reference_start - sclip_len > repeat_start - 50: continue
-                            # if the read has a MD tag
-                            upstream = fasta.fetch(chrom, repeat_start - 50, repeat_start)
-                            aligner = PairwiseAligner()
-                            aligner.mode = 'local'
-                            best_alingment_score = 0
-                            best_position = -1
-                            best_alignment = None
-                            for i in range(len(soft_clipped)):
-                                alignment = aligner.align(soft_clipped[i:i+50], upstream)
-                                if alignment[0].score > best_alingment_score and alignment[0].score > 40:
-                                    best_alingment_score = alignment[0].score
-                                    best_position = i
-                                    best_alignment = alignment[0]
-                            if best_position != -1:
-                                start_idx, end_idx = parse_cigar([(4, best_position), (0, 50), (1,sclip_len-best_position-50)] + read.cigartuples[1:],
-                                                                repeat_start-50, repeat_start, repeat_end)
-                                #read_data.append([chrom, repeat_start, repeat_end, read.query_name, read.reference_start, read.reference_end, start_idx, end_idx])
+                        flank_len = 50
+                        startclip_len = read.cigartuples[0][1] if read.cigartuples[0][0] == 4 else 0
+                        endclip_len = read.cigartuples[-1][1] if read.cigartuples[-1][0] == 4 else 0
+                        include_startclip = False; include_endclip = False
+                        sclip_cigartuples = []; eclip_cigartuples = []; new_cigartuples = []
+                        new_reference_start = read.reference_start
+
+                        if read.reference_start >= repeat_start - 10 and read.reference_start - startclip_len < repeat_start - 10:
+                            include_startclip = True
+                        if read.reference_end <= repeat_end + 10 and read.reference_end + endclip_len > repeat_end + 10:
+                            include_endclip = True
+                        if include_startclip:
+                            soft_clipped = read.query_sequence[:startclip_len]
+                            if read.reference_start - startclip_len >= repeat_start - 10: continue
+
+                            upstream = fasta.fetch(chrom, read.reference_start - flank_len, read.reference_start)
+                            alignment_score, strand, target_begin, target_end, query_begin, query_end, sCigar = align_pair(soft_clipped, upstream)
+                            
+                            sclip_cigartuples.append((4, target_begin))
+                            flank_reference_start = (read.reference_start - flank_len) + (query_begin - 1)
+                            sclip_cigartuples += convert_cigar(sCigar)
+                            flank_reference_end = flank_reference_start + query_end
+                            sclip_insert_len = startclip_len - target_end
+                            
+                            if read.reference_start - flank_reference_end > 0:
+                                sclip_cigartuples.append((0, read.reference_start - flank_reference_end))
+                            sclip_cigartuples.append((1, sclip_insert_len - (read.reference_start - flank_reference_end)))
+                            new_reference_start = flank_reference_start
+
+                        
+                        if include_endclip:
+                            soft_clipped = read.query_sequence[-endclip_len:]
+                            if read.reference_end + endclip_len <= repeat_end + 10: continue
+
+                            downstream = fasta.fetch(chrom, read.reference_end, read.reference_end + flank_len)
+                            alignment_score, strand, target_begin, target_end, query_begin, query_end, sCigar = align_pair(soft_clipped, downstream)
+
+                            eclip_insert_len = target_begin - 1 - query_begin - 1
+                            if eclip_insert_len > 0:
+                                eclip_cigartuples.append((1, eclip_insert_len))
+                            if query_begin - 1 > 0: eclip_cigartuples.append((8, query_begin - 1))
+                            eclip_cigartuples += convert_cigar(sCigar)
+                            if endclip_len - target_end > 0: eclip_cigartuples.append((4, endclip_len - target_end))
+                        
+                        if len(sclip_cigartuples) > 0:
+                            new_cigartuples = sclip_cigartuples + read.cigartuples[1:]
+                        else: new_cigartuples = read.cigartuples
+                        if len(eclip_cigartuples) > 0:
+                            new_cigartuples = new_cigartuples[:-1] + eclip_cigartuples
+                        
+                        # print(read.cigarstring, convert_cigartuples(new_cigartuples))
+                        start_idx, end_idx, sub_cigar = parse_cigar(new_cigartuples, new_reference_start, repeat_start, repeat_end)
+
 
                     # Get methylation
                     chunk_meth = []
@@ -196,18 +257,20 @@ def extract_reads(bed_file, bam_files, ref_fasta, aln_format):
                                         chunk_meth.append(prob)
                     # median meth
                     if len(chunk_meth) > 0:
-                        med_meth = stats.median(chunk_meth)
+                        med_meth = round(stats.median(chunk_meth), 3)
                     else:
                         med_meth = None
-                    allele_len = (end_idx - start_idx)/motif_len
+                    allele_len = round((end_idx - start_idx)/motif_len, 2)
 
-                    read_data.append([bam_id, f"{chrom}:{repeat_start}-{repeat_end}", read.query_name, start_idx, end_idx, allele_len, med_meth])
+                    # print(read.cigarstring, read.reference_start)
+                    read_data.append([f"{chrom}:{repeat_start}-{repeat_end}", read.query_name, start_idx, end_idx, sub_cigar, allele_len, med_meth])
+                    print(*read_data[-1], sep='\t')
 
-                read_data = sorted(read_data, key=lambda x: x[2])
+                # read_data = sorted(read_data, key=lambda x: x[5])
                 # Print header
-                print(f"#sample\tlocus\tread_name\tread_repeat_start\tread_repeat_end\tallele_length\tmedian_meth")
-                for data in read_data:
-                    print(*data, data[-1]-data[-2], sep='\t')
+                # print(f"#sample\tlocus\tread_name\tread_repeat_start\tread_repeat_end\trepeat_cigar\tallele_length\tmedian_meth")
+                # for data in read_data:
+                #     print(*data, sep='\t')
 
     for bam in bams: bam.close()
     fasta.close()
