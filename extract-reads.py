@@ -263,7 +263,7 @@ def extract_reads(bed_file, bam_files, ref_fasta, aln_format):
                     allele_len = round((end_idx - start_idx)/motif_len, 2)
 
                     # print(read.cigarstring, read.reference_start)
-                    read_data.append([f"{chrom}:{repeat_start}-{repeat_end}", read.query_name, start_idx, end_idx, sub_cigar, allele_len, med_meth])
+                    read_data.append([bam_id, f"{chrom}:{repeat_start}-{repeat_end}", read.query_name, start_idx, end_idx, sub_cigar, allele_len, med_meth])
                     print(*read_data[-1], sep='\t')
 
                 # read_data = sorted(read_data, key=lambda x: x[5])
