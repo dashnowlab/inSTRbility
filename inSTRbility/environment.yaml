@@ -1,0 +1,22 @@
+# environment.yml - conda environment for inSTRbility
+name: instrbility
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+
+dependencies:
+    - python=3.10
+    - pysam
+    - filelock
+    - samtools          # useful tooling (tabix/samtools) via bioconda
+    - pip
+    - setuptools
+    - pytest            # dev/test only, optional
+
+    - pip:
+        - wheel
+
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate instrbility
