@@ -64,13 +64,13 @@ def parse_cstag(read_index, read, loci_keys, loci_coords, read_loci_variations,
 
             if not haploid:
                 base_phredQ = read.query_qualities[qpos]
-                READ_VARS[read_index]['snps'].add(rpos)
+                READ_VARS[read_index]['X'].add(rpos)
                 
                 if rpos not in SNPS:
-                    SNPS[rpos] = { 'C': 1, sub_nuc: {read_index}, 'Q': { read_index: base_phredQ } }
+                    SNPS[rpos] = { 'COV': 1, sub_nuc: {read_index}, 'Q': { read_index: base_phredQ } }
                     bisect.insort(SORT_SNPS, rpos)
                 else:
-                    SNPS[rpos]['C'] += 1
+                    SNPS[rpos]['COV'] += 1
                     SNPS[rpos]['Q'][read_index] = base_phredQ
                     if sub_nuc in SNPS[rpos]: 
                         SNPS[rpos][sub_nuc].add(read_index)

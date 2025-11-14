@@ -102,20 +102,20 @@ def get_indel_position(cigar):
 
 
 def detect_flank(read, ref, flank_length, locus_start, locus_end, relative_position, indel_type, indel_length, 
-                 indel_position):
+                 indel_position, aligned_start, aligned_end, aligned_cigar):
     """
-        Identify the flanking sequences of the repeat region in the read
-        Args:
-            read: pysam read object
-            fasta: pysam fasta object
-            flank_length: length of the flanking sequence to be considered
-            locus_start: start coordinate of the repeat in reference
-            locus_end: end coordinate of the repeat in reference
+    Identify the flanking sequences of the repeat region in the read
+    Args:
+        read: pysam read object
+        fasta: pysam fasta object
+        flank_length: length of the flanking sequence to be considered
+        locus_start: start coordinate of the repeat in reference
+        locus_end: end coordinate of the repeat in reference
 
-        Returns:
-            [start, end, sub_cigar]
-            start and end coordinates of the flanking sequence in the read
-            sub_cigar: CIGAR string of the repeat alignment to the reference in the read
+    Returns:
+        [start, end, sub_cigar]
+        start and end coordinates of the flanking sequence in the read
+        sub_cigar: CIGAR string of the repeat alignment to the reference in the read
     """
 
     sub_cigar = ''
@@ -237,12 +237,21 @@ def detect_flank(read, ref, flank_length, locus_start, locus_end, relative_posit
     return [start_idx, end_idx, sub_cigar]
 
 
-def update_homopolymer_coords(ref_seq, locus_start, homopoly_positions):
+def update_homopolymer_coords(seq, locus_start, homopoly_positions):
     """
     Record all the homopolymer stretches of at least 3 bases within the repeat coordinates
+
+    Args:
+        seq (str): Reference sequence of the repeat region
+        locus_start (int): Start position of the repeat region in the reference genome
+        homopoly_positions (dict): Dictionary to store homopolymer positions
+    
+    Returns:
+        None: Updates the homopoly_positions dictionary in place.
     """
-    prev_N = ref_seq[0]; start = -1
-    for i, n in enumerate(ref_seq[1:]):
+
+    prev_N = seq[0]; start = -1
+    for i, n in enumerate(seq[1:]):
         if n == prev_N:
             if start == -1: start = i
         else:
@@ -385,7 +394,8 @@ def deletion_jump(rpos, qpos, deletion_length, repeat_index, loci_keys, loci_coo
 
 
 def insertion_jump(rpos, qpos, insertion_length, insert, repeat_index, loci_keys, loci_coords, 
-                   read_loci_info, read, ref, homopoly_positions, flank_length):
+                   read_loci_info, read, ref, homopoly_positions, flank_length, aligned_start,
+                   aligned_end, aligned_cigartuples):
     """
     Record the insertion in read and loci variations and return the last tracked repeat index
     Args:
@@ -422,33 +432,37 @@ def insertion_jump(rpos, qpos, insertion_length, insert, repeat_index, loci_keys
             # if the insertion is within the flank of the repeat
             if locus_start - flank_length <= rpos < locus_start:    
                 # if an indel is found in the upstream flank of the repeat we realign the flank sequence to identify the coordinates of the repeat
-                result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'upstream', 'I', insertion_length, rpos)
-                # if realignment results in inertion at the same position we continue
-                if result == True or result[0] == -1 or result[1] == -1: pass
-                else:
-                    start_idx, end_idx, _ = result
-                    alen = end_idx - start_idx
-                    if alen > ((locus_end - locus_start)*10): pass
-                    else:
-                        read_loci_info[locus_key]['range'][0] = start_idx
-                        read_loci_info[locus_key]['range'][1] = end_idx
-                        read_loci_info[locus_key]['tracked']  = True
-                        read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                # result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'upstream', 'I', insertion_length, rpos,
+                #                       aligned_start, aligned_end, aligned_cigartuples)
+                # # if realignment results in inertion at the same position we continue
+                # if result == True or result[0] == -1 or result[1] == -1: pass
+                # else:
+                #     start_idx, end_idx, _ = result
+                #     alen = end_idx - start_idx
+                #     if alen > ((locus_end - locus_start)*10): pass
+                #     else:
+                #         read_loci_info[locus_key]['range'][0] = start_idx
+                #         read_loci_info[locus_key]['range'][1] = end_idx
+                #         read_loci_info[locus_key]['tracked']  = True
+                #         read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                pass
            
             elif locus_end < rpos <= locus_end + flank_length:
                 # if an indel is found in the downstream flank of the repeat we realign the flank sequence to identify the coordinates of the repeat
-                result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'downstream', 'I', insertion_length, rpos)
-                # if realignment results in insertion at the same position
-                if result == True or result[0] == -1 or result[1] == -1: pass
-                else:
-                    start_idx, end_idx, _ = result
-                    alen = end_idx - start_idx
-                    if alen > ((locus_end - locus_start)*10): pass
-                    else:
-                        read_loci_info[locus_key]['range'][0] = start_idx
-                        read_loci_info[locus_key]['range'][1] = end_idx
-                        read_loci_info[locus_key]['tracked']  = True
-                        read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                # result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'downstream', 'I', insertion_length, rpos,
+                #                       aligned_start, aligned_end, aligned_cigartuples)
+                # # if realignment results in insertion at the same position
+                # if result == True or result[0] == -1 or result[1] == -1: pass
+                # else:
+                #     start_idx, end_idx, _ = result
+                #     alen = end_idx - start_idx
+                #     if alen > ((locus_end - locus_start)*10): pass
+                #     else:
+                #         read_loci_info[locus_key]['range'][0] = start_idx
+                #         read_loci_info[locus_key]['range'][1] = end_idx
+                #         read_loci_info[locus_key]['tracked']  = True
+                #         read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                pass
 
             # if the locus is not tracked
             # what is the possible case that we reached in the middle of the repeat and it has not been tracked?
@@ -473,33 +487,37 @@ def insertion_jump(rpos, qpos, insertion_length, insert, repeat_index, loci_keys
             # if the insertion is within the flank of the repeat
             elif locus_start - flank_length <= rpos and rpos < locus_start:
                 # if an indel is found in the upstream flank of the repeat we realign the flank sequence to identify the coordinates of the repeat
-                result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'upstream', 'I', insertion_length, rpos)
-                # if realignment results in inertion at the same position we continue
-                if result == True or result[0] == -1 or result[1] == -1: pass
-                else:
-                    start_idx, end_idx, _ = result
-                    alen = end_idx - start_idx
-                    if alen > ((locus_end - locus_start)*10): pass
-                    else:
-                        read_loci_info[locus_key]['range'][0] = start_idx
-                        read_loci_info[locus_key]['range'][1] = end_idx
-                        read_loci_info[locus_key]['tracked']  = True
-                        read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                # result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'upstream', 'I', insertion_length, rpos,
+                #                       aligned_start, aligned_end, aligned_cigartuples)
+                # # if realignment results in inertion at the same position we continue
+                # if result == True or result[0] == -1 or result[1] == -1: pass
+                # else:
+                #     start_idx, end_idx, _ = result
+                #     alen = end_idx - start_idx
+                #     if alen > ((locus_end - locus_start)*10): pass
+                #     else:
+                #         read_loci_info[locus_key]['range'][0] = start_idx
+                #         read_loci_info[locus_key]['range'][1] = end_idx
+                #         read_loci_info[locus_key]['tracked']  = True
+                #         read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                pass
 
             elif locus_end < rpos and rpos <= locus_end + flank_length:
                 # if an indel is found in the downstream flank of the repeat we realign the flank sequence to identify the coordinates of the repeat
-                result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'downstream', 'I', insertion_length, rpos)
-                # if realignment results in insertion at the same position
-                if result == True or result[0] == -1 or result[1] == -1: pass
-                else:
-                    start_idx, end_idx, _ = result
-                    alen = end_idx - start_idx
-                    if alen > ((locus_end - locus_start)*10): pass
-                    else:
-                        read_loci_info[locus_key]['range'][0] = start_idx
-                        read_loci_info[locus_key]['range'][1] = end_idx
-                        read_loci_info[locus_key]['tracked']  = True
-                        read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                # result = detect_flank(read, ref, flank_length, locus_start, locus_end, 'downstream', 'I', insertion_length, rpos,
+                #                       aligned_start, aligned_end, aligned_cigartuples)
+                # # if realignment results in insertion at the same position
+                # if result == True or result[0] == -1 or result[1] == -1: pass
+                # else:
+                #     start_idx, end_idx, _ = result
+                #     alen = end_idx - start_idx
+                #     if alen > ((locus_end - locus_start)*10): pass
+                #     else:
+                #         read_loci_info[locus_key]['range'][0] = start_idx
+                #         read_loci_info[locus_key]['range'][1] = end_idx
+                #         read_loci_info[locus_key]['tracked']  = True
+                #         read_loci_info[locus_key]['HALEN'] = end_idx - start_idx
+                pass
 
         # if the insert falls in the flank of the repeat we then try to find the flanks by sequence
         if locus_start <= rpos <= locus_end: # introduced to include length only if it comes inside repeat region

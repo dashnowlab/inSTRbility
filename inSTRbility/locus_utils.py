@@ -1,6 +1,8 @@
 # from realignment_utils import *
 from genotype_utils import assign_haplogroups
 from collections import Counter
+from instabillity_utils import consensus_allele
+import sys
 
 
 def get_mode(list):
@@ -93,6 +95,8 @@ def process_locus(locus_start, locus_end, locus_key, prev_locus_end, LOCI_VARS,
 
     read_indices = LOCI_VARS[locus_key]['RDS']   # the read indices which cover the locus
     haplotags = LOCI_VARS[locus_key]['HP']
+    check = False
+    if None in haplotags: check = True
     total_reads = len(read_indices)                             # total number of reads
 
     read_max_limit = 0
@@ -127,7 +131,8 @@ def process_locus(locus_start, locus_end, locus_key, prev_locus_end, LOCI_VARS,
         hap_status = all([len(hap)>0 for hap in haplotypes])
 
     # processing haplotagged reads to write into vcf_heterozygous
-    if hap_status & ((haplotags.count(None)/total_reads) <= 0.15):
+    # if hap_status & ((haplotags.count(None)/total_reads) <= 0.15):
+    if hap_status & (total_reads - haplotags.count(None) >= 20):
         phasing_category = 3 # phased
 
     elif len(hallele_counter) == 1:
@@ -152,7 +157,7 @@ def process_locus(locus_start, locus_end, locus_key, prev_locus_end, LOCI_VARS,
     return [PREV_READS, phasing_category, hallele_counter, fail_code, read_max_limit, haplotypes]
 
 
-def locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
+def locus_processor(args, tbx, ref, out, reads_out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
                     PREV_READS, READ_NAMES, SNPS, SORT_SNPS, haploid, prev_locus_end, flank):
     """
     Processing the information of a locus after processing all the reads that overlap the locus
@@ -180,6 +185,15 @@ def locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_I
     locus_chrom = LOCI_INFO[locus_key][0]
     locus_start = int(LOCI_INFO[locus_key][1])
     locus_end   = int(LOCI_INFO[locus_key][2])
+    motif_length = len(LOCI_INFO[locus_key][3])
+
+    nucleotides = set(['A', 'T', 'C', 'G', 'a', 't', 'c', 'g'])
+    if len(set(LOCI_INFO[locus_key][3]) - nucleotides) > 0:
+        # if the motif is not a nucleotide sequence, it is a random or complex motif
+        # so we set the motif length to -1
+        motif_length = -1
+
+    # if LOCI_INFO[locus_key][3] == 'random' or LOCI_INFO[locus_key] == 'complex': motif_length = -1
 
     near_by_loci = []
     for row in tbx.fetch(locus_chrom, locus_start-flank, locus_end+flank):
@@ -201,11 +215,11 @@ def locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_I
         if phasing_category == 1: # phasing category is homozygous
             zygosity = 'homozygous'
             reads_phased, fail_code = assign_haplogroups(locus_chrom, locus_start, locus_end, locus_key, LOCI_INFO, LOCI_VARS, READ_VARS, READ_NAMES,
-                                                         SNPS, hallele_counter, ref, out, args, read_max_limit, haploid, homozygous=True)
+                                                         SNPS, hallele_counter, args, read_max_limit, haploid, homozygous=True)
 
         elif phasing_category == 2:  # phasing category is ambiguous - needs to be phased either based on SNPs of lengths
             reads_phased, fail_code = assign_haplogroups(locus_chrom, locus_start, locus_end, locus_key, LOCI_INFO, LOCI_VARS, READ_VARS, READ_NAMES,
-                                                         SNPS, hallele_counter, ref, out, args, read_max_limit, haploid)
+                                                         SNPS, hallele_counter, args, read_max_limit, haploid)
 
             if reads_phased and reads_phased != 'unphased':
                 # based on the haplogroups we identify the allele lengths in the haplogroups
@@ -230,7 +244,19 @@ def locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_I
                 }
 
         elif phasing_category == 3: # phased based on haplotag
-            pass
+            reads_phased = 'haplotag-based'
+            A = []; B = []
+            for _, hp in enumerate(LOCI_VARS[locus_key]['HP']):
+                if hp == 1: A.append(LOCI_VARS[locus_key]['A'][LOCI_VARS[locus_key]['RDS'][_]][0])
+                elif hp == 2: B.append(LOCI_VARS[locus_key]['A'][LOCI_VARS[locus_key]['RDS'][_]][0])
+            A = get_mode(A)
+            B = get_mode(B)
+
+            # the allele sizes are None if the haplogroup is empty
+            if A is None and B is None: zygosity = 'unphased'
+            elif A is None or B is None: zygosity = 'homozygous'
+            elif A == B: zygosity = 'homozygous'
+            else: zygosity = 'heterozygous'
 
         else:
             zygosity = 'unphased'
@@ -239,12 +265,16 @@ def locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_I
         read_indices = LOCI_VARS[locus_key]['RDS']
         sorted_ridx = sorted(list(range(0, len(read_indices))), key=lambda x: LOCI_VARS[locus_key]['HP'][x] if LOCI_VARS[locus_key]['HP'][x] is not None else 3)
 
+        if fail_code == 10 and (reads_phased == 'snp-based' or reads_phased == 'haplotag-based'):
+            consensus_allele(locus_key, LOCI_VARS, LOCI_INFO, motif_length, args.pure_stretch, args.num_hpreads, out)
+
         for ridx in sorted_ridx:
             read_idx = LOCI_VARS[locus_key]['RDS'][ridx]
             fail_messages = {1: 'low-reads', 2: 'nosig-snps', 3: 'low-read-snps', 4: 'low-reads-cluster', 6: 'low-reads', 10: 'pass'}
-            print(locus_key, fail_messages[fail_code], zygosity, reads_phased, READ_NAMES[read_idx],
-                  LOCI_VARS[locus_key]['RNG'][read_idx][0], LOCI_VARS[locus_key]['RNG'][read_idx][1], LOCI_VARS[locus_key]['A'][read_idx][0],
-                  LOCI_VARS[locus_key]['S'][read_idx], LOCI_VARS[locus_key]['Q'][ridx], LOCI_VARS[locus_key]['HP'][ridx], sep='\t', file=out)
+            if reads_out is not None:
+                print(locus_key, fail_messages[fail_code], zygosity, reads_phased, READ_NAMES[read_idx], LOCI_VARS[locus_key]['RNG'][read_idx][0],
+                      LOCI_VARS[locus_key]['RNG'][read_idx][1], LOCI_VARS[locus_key]['A'][read_idx][0], LOCI_VARS[locus_key]['S'][read_idx],
+                      LOCI_VARS[locus_key]['Q'][ridx], LOCI_VARS[locus_key]['HP'][ridx], sep='\t', file=reads_out)
 
         del LOCI_VARS[locus_key]
         del LOCI_INFO[locus_key]

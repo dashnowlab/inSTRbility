@@ -49,10 +49,17 @@ def parse_cigar(read_index, read, loci_keys, loci_coords, read_loci_info, homopo
         None: Updates the global and local read variation and global snp information in place.
     """
 
+    # initialising sorted SNP positions
+    if SORT_SNPS == None: SORT_SNPS = []
+
     chrom = read.reference_name
 
     rpos = read.reference_start   # NOTE: The coordinates are 1 based in SAM
     qpos = 0            # starts from 0 the sub string the read sequence in python
+
+    loci_info = {}
+    for key in loci_keys:
+        loci_info[key] = { 'range': [0,0], 'flank_range': [0, 0], 'tracked': False, 'flank_tracked': [False, False] }
 
     repeat_index = 0
 
@@ -84,7 +91,8 @@ def parse_cigar(read_index, read, loci_keys, loci_coords, read_loci_info, homopo
             insertion_point[rpos] = insert_length
             qpos += insert_length
             repeat_index += insertion_jump(rpos, qpos, insert_length, insert, repeat_index, loci_keys, loci_coords,
-                                           read_loci_info, read, ref, homopoly_positions, flank_length)
+                                           read_loci_info, read, ref, homopoly_positions, flank_length, read.reference_start,
+                                           read.reference_end, read.cigartuples)
 
         elif cigar[0] == 0: # match (both equals & difference)
             match_length = cigar[1]
@@ -101,18 +109,17 @@ def parse_cigar(read_index, read, loci_keys, loci_coords, read_loci_info, homopo
 
                 for sub_pos in substitution_positions:
                     sub_nuc = query_sequence[qpos + sub_pos]
-                    Qval = read.query_qualities[qpos + sub_pos]
+                    base_phredQ = read.query_qualities[qpos + sub_pos]
                     READ_VARS[read_index]['X'].add(rpos + sub_pos)
                     if rpos + sub_pos not in SNPS:
-                        SNPS[rpos + sub_pos] = { 'COV': 1, sub_nuc: {read_index}, 'Q': { read_index: Qval } }
+                        SNPS[rpos + sub_pos] = { 'COV': 1, sub_nuc: {read_index}, 'Q': { read_index: base_phredQ } }
                         bisect.insort(SORT_SNPS, rpos + sub_pos)
                     else:
                         SNPS[rpos+sub_pos]['COV'] += 1
-                        SNPS[rpos+sub_pos]['Q'][read_index] = Qval
+                        SNPS[rpos+sub_pos]['Q'][read_index] = base_phredQ
                         if sub_nuc in SNPS[rpos+sub_pos]: 
                             SNPS[rpos + sub_pos][sub_nuc].add(read_index)
-                            
-                        else: SNPS[rpos + sub_pos][sub_nuc] = { read_index }
+                        else: SNPS[rpos + sub_pos][sub_nuc] = {read_index}
 
             qpos += match_length; rpos += match_length
             repeat_index += match_jump(rpos, qpos, match_length, repeat_index, loci_keys, loci_coords, read_loci_info)
@@ -138,7 +145,6 @@ def parse_cigar(read_index, read, loci_keys, loci_coords, read_loci_info, homopo
                         SNPS[rpos + pos]['Q'][read_index] = Qval
                         if sub_nuc in SNPS[rpos + pos]: 
                             SNPS[rpos + pos][sub_nuc].add(read_index)
-                            
                         else: SNPS[rpos + pos][sub_nuc] = {read_index}
             qpos += substitution_length; rpos += substitution_length
             repeat_index += match_jump(rpos, qpos, substitution_length, repeat_index, loci_keys, loci_coords, read_loci_info)
@@ -149,7 +155,7 @@ def parse_cigar(read_index, read, loci_keys, loci_coords, read_loci_info, homopo
             else: qpos=0
             MD_tag = read.get_tag('MD')
             parse_mdtag(MD_tag, qpos, read.reference_start, READ_VARS, SNPS, read_index,
-                        read.query_qualitites, read.query_Sequence, SORT_SNPS, insertion_point)
+                        read.query_qualities, read.query_sequence, SORT_SNPS, insertion_point)
 
     for idx, loc_key in enumerate(loci_keys):
         spos = read_loci_info[loc_key]['range'][0]

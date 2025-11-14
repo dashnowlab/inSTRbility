@@ -9,16 +9,10 @@ def length_genotyper(locus_key, hallele_counter, LOCI_VARS, read_indices, haploi
     """
     Build genotype based on the allele lengths of the reads
     Args:
-        chrom (str): Chromosome name.
-        locus_start (int): Start position of the locus.
-        locus_end (int): End position of the locus.
         locus_key (str): Key for the locus.
         hallele_counter (dict): Dictionary with allele lengths and their counts.
-        LOCI_INFO (dict): Global locus information.
         LOCI_VARS (dict): Global locus variations.
         read_indices (list): List of read indices.
-        ref (pysam.FastaFile): Reference genome.
-        out (file): Output file handle.
         haploid (bool): Whether the analysis is for haploid genomes.
     Returns:
         list: [state, fail_code] where state is True if genotype was successfully built,
@@ -121,7 +115,7 @@ def snp_filtering(snp_position, SNPS, args, locus_start, locus_end):
 
 
 def assign_haplogroups(chrom, locus_start, locus_end, locus_key, LOCI_INFO, LOCI_VARS, READ_VARS, READ_NAMES,
-                       SNPS, hallele_counter, ref, out, args, read_max_limit, haploid, homozygous=False):
+                       SNPS, hallele_counter, args, read_max_limit, haploid, homozygous=False):
     """
     Analyse the genotype for a given locus
     """

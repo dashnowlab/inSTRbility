@@ -14,6 +14,7 @@ import timeit as ti
 import gzip
 import math
 from . import ssw_lib
+from collections import namedtuple
 
 
 def suppress_stderr():
@@ -241,7 +242,23 @@ def include_substitution(sCigar, target, query, tbegin, qbegin):
             clen = ''
     return new_cigar
 
+
 def align_pair(target, query, nMatch=2, nMismatch=2, nOpen=3, nExt=1):
+    """
+    Align a pair of sequences using SSW library.
+
+    Args:
+        target (str): The target sequence.
+        query (str): The query sequence.
+        nMatch (int): Score for a match.
+        nMismatch (int): Penalty for a mismatch.
+        nOpen (int): Penalty for opening a gap.
+        nExt (int): Penalty for extending a gap.
+    Returns:
+        tuple: A tuple containing the alignment score, orientation, target begin, target end,
+               query begin, query end, and CIGAR string.
+    """
+
     lEle = []
     dRc = {} 
     dEle2Int = {}

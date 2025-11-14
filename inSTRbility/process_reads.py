@@ -150,7 +150,7 @@ def record_readloci(args, tbx, read, first_region, last_region, LOCI_INFO, LOCI_
         elif locus_start < first_region[0]:
             # if the locus is before the first region
             continue
-        elif locus_start >= last_region:
+        elif locus_start >= last_region[1]:
             # if the locus is beyond the last region
             break
 
@@ -200,22 +200,33 @@ def extract_reads(args, bam_file, coordinate_range, tidx, karyotype):
     tbx  = pysam.Tabixfile(args.bed)
     ref  = pysam.FastaFile(args.ref)
     bam  = pysam.AlignmentFile(bam_file, args.aln_format)
+    reads_out = None
 
     # set output file and log file names
     if tidx != -1:
         if tidx==0:
             out = open(f'{args.output}', 'w')
+            print('#locus_id', 'haplogroup', 'motif', 'allele_length', 'mean_ad', 'median_ad', 'read_distribution', sep='\t', file=out)
+            if args.reads_out:
+                reads_out = open(f'{args.output}.reads', 'w')
+                print('#locus_id', 'fail_code', 'zygosity', 'phased_on', 'read_index', 'read_start_pos', 'read_end_pos',
+                      'allele_length', 'sequence', 'avg_basequal', 'haplotag', sep='\t', file=reads_out)
+
         else:
-            out = open(f'{args.output}_thread_{tidx}', 'w')
+            out = open(f'{args.output}_thread_{tidx}.out', 'w')
+            if args.reads_out:
+                reads_out = open(f'{args.output}_thread_{tidx}.reads', 'w')
 
     else:
         out = open(f'{args.output}', 'w')
+        print('#locus_id', 'haplogroup', 'motif', 'allele_length', 'mean_ad', 'median_ad', 'read_distribution', sep='\t', file=out)
+        if args.reads_out:
+            reads_out = open(f'{args.output}.reads', 'w')
+            print('#locus_id', 'fail_code', 'zygosity', 'phased_on', 'read_index', 'read_start_pos', 'read_end_pos',
+                  'allele_length', 'sequence', 'avg_basequal', 'haplotag', sep='\t', file=reads_out)
 
     # used for identifying the flanking region within the read incase there's indels nearby
     flank_length = 50
-
-    print('locus_id', 'fail_code', 'zygosity', 'phased_on', 'read_index', 'read_start_pos', 'read_end_pos',
-          'allele_length', 'sequence', 'avg_basequal', 'haplotag', sep='\t', file=out)
 
     # contig range is a list of tuples
     # each tuple containes a chromosome, the coordinates of the first region and the coordinates of the last region
@@ -269,7 +280,7 @@ def extract_reads(args, bam_file, coordinate_range, tidx, karyotype):
             while len(LOCI_ENDS) > 0 and read_start > LOCI_ENDS[0]:
                 # if the current read is beyond the start of the first locus
                 # we process the first locus for its variations
-                prev_locus_end = locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
+                prev_locus_end = locus_processor(args, tbx, ref, out, reads_out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
                                                  PREV_READS, READ_NAMES, SNPS, SORT_SNPS, haploid, prev_locus_end, flank_length)
 
             while len(LOCI_ENDS) > 0 and read_start > READ_ENDS[0]:
@@ -350,8 +361,9 @@ def extract_reads(args, bam_file, coordinate_range, tidx, karyotype):
         while len(LOCI_ENDS) > 0:
             # if the current read is beyond the start of the first locus
             # we process the first locus for its variations
-            prev_locus_end = locus_processor(args, tbx, ref, out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
-                                                PREV_READS, READ_NAMES, SNPS, SORT_SNPS, haploid, prev_locus_end, flank_length)
+
+            prev_locus_end = locus_processor(args, tbx, ref, out, reads_out, LOCI_KEYS, LOCI_ENDS, LOCI_VARS, LOCI_INFO, READ_VARS,
+                                             PREV_READS, READ_NAMES, SNPS, SORT_SNPS, haploid, prev_locus_end, flank_length)
 
         while len(LOCI_ENDS) > 0:
             # if the current read is beyond the start of the first locus
@@ -363,3 +375,5 @@ def extract_reads(args, bam_file, coordinate_range, tidx, karyotype):
     ref.close()
     tbx.close()
     out.close()
+    if reads_out is not None:
+        reads_out.close()

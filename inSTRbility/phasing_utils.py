@@ -1,7 +1,18 @@
 import numpy as np
+import sys
 
 
 def build_cluster_haplotypes(cluster, significant_snps, SNPS):
+    """
+    Build the consensus haplotype for each cluster based on the SNPs
+    Args:
+        cluster (set): Set of read indices in the cluster.
+        significant_snps (list): List of SNP positions.
+        SNPS (dict): Dictionary containing SNP information.
+    Returns:
+        dict: A dictionary containing the haplotype for the cluster. { pos: allele }
+    """
+
     cluster_haplotype = {}
     for read_idx in cluster:
         for snp_pos in significant_snps:
@@ -19,7 +30,18 @@ def build_cluster_haplotypes(cluster, significant_snps, SNPS):
         cluster_haplotype[snp_pos] = sorted(cluster_haplotype[snp_pos].items(), key=lambda item: item[1], reverse=True)[0][0]
     return cluster_haplotype
 
+
 def print_cluster_haplotypes(clusters, read_indices, READ_NAMES):
+    """
+    Print the haplotypes for each cluster in a readable format.
+    Args:
+        clusters (list): List of clusters containing SNP positions and their alleles.
+        read_indices (set): Set of read indices that are part of the clusters.
+        READ_NAMES (list): List of read names corresponding to the read indices.
+    Returns:
+        None: Prints the haplotypes for each cluster.
+    """
+
     snps = []
     for cluster in clusters:
         snps +=  list(cluster.keys())
@@ -31,7 +53,8 @@ def print_cluster_haplotypes(clusters, read_indices, READ_NAMES):
                 alleles.append(cluster[snp])
             else:
                 alleles.append('-')
-        print(READ_NAMES[read_indices[i]], ''.join(alleles), sep='\t')
+        print(READ_NAMES[read_indices[i]], ''.join(alleles), sep='\t', file=sys.stderr)
+
 
 def phase_unphased_reads(unphased_read, snps, final_haplotypes, SNPS):
     """
@@ -99,6 +122,15 @@ def phase_unphased_reads(unphased_read, snps, final_haplotypes, SNPS):
 
 
 def delete_lowcov_alleles(passed_snps, filtered_snp_info, args):
+    """
+    Removes the SNP alleles that have low coverage based on user-defined parameters.
+    Args:
+        passed_snps (list): List of SNP positions that have passed the initial filtering.
+        filtered_snp_info (dict): Dictionary containing SNP positions and their alleles with supporting reads.
+        args (Namespace): Command line arguments containing parameters like snp_reads.
+    Returns:
+        None: The function modifies the filtered_snp_info dictionary in place.
+    """
 
     # for each snp position we get rid of the nucs that have coverage lesser than user parameters
     for position in passed_snps:
@@ -119,81 +151,6 @@ def delete_lowcov_alleles(passed_snps, filtered_snp_info, args):
             del_positions.append(pos)
     for pos in del_positions:
         del filtered_snp_info[pos]
-
-
-def haplocluster_reads(sorted_snps, snp_info, read_indices, SNPS, READ_NAMES, args):
-    """
-    Function to cluster the reads based on SNPs and their supporting reads.
-
-    Args:
-        snp_allelereads (dict): Dictionary containing SNP positions and their alleles with supporting reads.
-        coverage_sorted_snps (list): List of SNP positions sorted by coverage.
-        read_indices (set): Set of read indices that support the SNPs.
-        args (Namespace): Command line arguments containing parameters like snpC, snpR, phasingR, snpQ.
-
-    Returns:
-        list: A list containing the final haplotypes, minimum SNP position, skip point,
-    """
-
-    threshold_range = [(0.3, 0.7),(0.25, 0.75),(0.2, 0.8)] # threshold values to get Significant_snps
-    for idx, range in enumerate(threshold_range):
-
-        final_haplotypes = ()
-        fail_code = 10
-
-        r1 = range[0] # threshold value 1
-        r2 = range[1] # threshold value 2
-
-        filtered_snp_info = {}
-        passed_snps     = []
-
-        for pos in sorted_snps:
-            # if the position is covered by less than 60% of the reads corresponding to the locus, skip it
-            if snp_info[pos]['cov'] < (0.6*len(read_indices)):
-                fail_code = 3; break
-
-            passed_alleles = 0
-            pos_coverage = snp_info[pos]['cov']
-            for allele in snp_info[pos]['alleles']:
-                allele_cov = len(snp_info[pos]['alleles'][allele])
-                # allele coverage falls within the range for possible segregation
-                if r1 * pos_coverage <= allele_cov <= r2 * pos_coverage:
-                    passed_alleles += 1
-
-            if passed_alleles >= 2: # if the SNP position has atleast 2 nucs that pass the threshold
-                passed_snps.append(pos)
-                filtered_snp_info[pos] = {'cov': snp_info[pos]['cov'], 'alleles': snp_info[pos]['alleles'], 'Q': snp_info[pos]['Q']}
-
-        if len(filtered_snp_info) == 0:
-            if idx < 2:   # move to the next threshold range
-                continue
-            else:
-                fail_code = 2
-
-                return [final_haplotypes, fail_code, 0]
-
-        if len(passed_snps) == 0:
-            fail_code = 2
-            return [(), fail_code, len(passed_snps)]
-
-        passed_snps = passed_snps[:args.snp_count] # limiting the number of SNPs to be considered for phasing
-
-        delete_lowcov_alleles(passed_snps, filtered_snp_info, args) # remove alleles which have low coverage in the passed SNPs
-
-        # if all the SNP positions failed the coverage filtering then we skip phasing
-        if len(filtered_snp_info) == 0: # after removing snp based on their nuc's read coverage, if there are no snp left then go to next threshold range
-            fail_code = 2
-            return [(), fail_code, len(passed_snps)]
-
-        result = merge_snpreadsets(passed_snps, filtered_snp_info, read_indices, sorted_snps, SNPS, READ_NAMES, args) # calling the phasing function
-        final_haplotypes, status, fail_code, snp_num = result
-
-        if status: break
-
-        if idx == 2: #level_split:
-            break
-
-    return [final_haplotypes, fail_code, snp_num]
 
 
 def merge_snpreadsets(snps, snp_info, read_indices, unfiltered_snps, SNPS, READ_NAMES, args):
@@ -293,6 +250,81 @@ def merge_snpreadsets(snps, snp_info, read_indices, unfiltered_snps, SNPS, READ_
         return [(), False, fail_code, len(snps)]
 
 
+def haplocluster_reads(sorted_snps, snp_info, read_indices, SNPS, READ_NAMES, args):
+    """
+    Function to cluster the reads based on SNPs and their supporting reads.
+
+    Args:
+        snp_allelereads (dict): Dictionary containing SNP positions and their alleles with supporting reads.
+        coverage_sorted_snps (list): List of SNP positions sorted by coverage.
+        read_indices (set): Set of read indices that support the SNPs.
+        args (Namespace): Command line arguments containing parameters like snpC, snpR, phasingR, snpQ.
+
+    Returns:
+        list: A list containing the final haplotypes, minimum SNP position, skip point,
+    """
+
+    threshold_range = [(0.3, 0.7),(0.25, 0.75),(0.2, 0.8)] # threshold values to get Significant_snps
+    for idx, range in enumerate(threshold_range):
+
+        final_haplotypes = ()
+        fail_code = 10
+
+        r1 = range[0] # threshold value 1
+        r2 = range[1] # threshold value 2
+
+        filtered_snp_info = {}
+        passed_snps     = []
+
+        for pos in sorted_snps:
+            # if the position is covered by less than 60% of the reads corresponding to the locus, skip it
+            if snp_info[pos]['cov'] < (0.6*len(read_indices)):
+                fail_code = 3; break
+
+            passed_alleles = 0
+            pos_coverage = snp_info[pos]['cov']
+            for allele in snp_info[pos]['alleles']:
+                allele_cov = len(snp_info[pos]['alleles'][allele])
+                # allele coverage falls within the range for possible segregation
+                if r1 * pos_coverage <= allele_cov <= r2 * pos_coverage:
+                    passed_alleles += 1
+
+            if passed_alleles >= 2: # if the SNP position has atleast 2 nucs that pass the threshold
+                passed_snps.append(pos)
+                filtered_snp_info[pos] = {'cov': snp_info[pos]['cov'], 'alleles': snp_info[pos]['alleles'], 'Q': snp_info[pos]['Q']}
+
+        if len(filtered_snp_info) == 0:
+            if idx < 2:   # move to the next threshold range
+                continue
+            else:
+                fail_code = 2
+
+                return [final_haplotypes, fail_code, 0]
+
+        if len(passed_snps) == 0:
+            fail_code = 2
+            return [(), fail_code, len(passed_snps)]
+
+        passed_snps = passed_snps[:args.nsnps] # limiting the number of SNPs to be considered for phasing
+
+        delete_lowcov_alleles(passed_snps, filtered_snp_info, args) # remove alleles which have low coverage in the passed SNPs
+
+        # if all the SNP positions failed the coverage filtering then we skip phasing
+        if len(filtered_snp_info) == 0: # after removing snp based on their nuc's read coverage, if there are no snp left then go to next threshold range
+            fail_code = 2
+            return [(), fail_code, len(passed_snps)]
+
+        result = merge_snpreadsets(passed_snps, filtered_snp_info, read_indices, sorted_snps, SNPS, READ_NAMES, args) # calling the phasing function
+        final_haplotypes, status, fail_code, snp_num = result
+
+        if status: break
+
+        if idx == 2: #level_split:
+            break
+
+    return [final_haplotypes, fail_code, snp_num]
+
+
 def score_cluster_membership(cluster, read_idx, read_indices, score_matrix):
     """
     Function to score the membership of a read in a cluster based on its supporting reads.
@@ -332,15 +364,16 @@ def qvalue_phasing(sorted_snps, read_indices, SNPS, haplotypes=None):
 
     sorted_reads = sorted(read_indices)
 
-    clusters = []
-    for read_idx in read_indices:
-        clusters.append(build_cluster_haplotypes({read_idx}, sorted_snps, SNPS))
+    # clusters = []
+    # for read_idx in read_indices:
+    #     clusters.append(build_cluster_haplotypes({read_idx}, sorted_snps, SNPS))
 
     score_matrix = []
     for i, read_a in enumerate(sorted_reads):
         for j, read_b in enumerate(sorted_reads):
             if read_a == read_b: score_matrix.append(0); continue
             if j < i: score_matrix.append(score_matrix[j*len(sorted_reads) + i]); continue
+            
             score = 0
             for snp_pos in sorted_snps:
                 allele_a = None; qual_a = None
@@ -407,8 +440,8 @@ def qvalue_phasing(sorted_snps, read_indices, SNPS, haplotypes=None):
             score_a2 = score_cluster_membership(cluster2, read_a, sorted_reads, score_matrix)
             if   score_a1 < score_a2: cluster2.add(read_a)
             elif score_a1 > score_a2: cluster1.add(read_a)
-            else: print('Unassigned read:', read_a)
+            else: print('Unassigned read:', read_a, file=sys.stderr)
             phased_reads.add(read_a)
 
-    print('Cluster 1:', sorted(cluster1))
-    print('Cluster 2:', sorted(cluster2))
+    print('Cluster 1:', sorted(cluster1), file=sys.stderr)
+    print('Cluster 2:', sorted(cluster2), file=sys.stderr)
