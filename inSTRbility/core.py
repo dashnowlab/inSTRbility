@@ -11,8 +11,8 @@ import argparse as ap
 from filelock import FileLock
 from multiprocessing import Process
 
-from version import __version__
-from process_reads import *
+from inSTRbility.version import __version__
+from inSTRbility.process_reads import *
 
 def parse_args():
     """

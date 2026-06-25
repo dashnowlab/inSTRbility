@@ -1,7 +1,7 @@
 # from realignment_utils import *
-from genotype_utils import assign_haplogroups
+from inSTRbility.genotype_utils import assign_haplogroups
 from collections import Counter
-from instabillity_utils import consensus_allele
+from inSTRbility.instabillity_utils import consensus_allele
 import sys
 
 

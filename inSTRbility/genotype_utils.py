@@ -1,4 +1,4 @@
-from phasing_utils import haplocluster_reads, qvalue_phasing
+from inSTRbility.phasing_utils import haplocluster_reads, qvalue_phasing
 import numpy as np
 from sklearn.cluster import KMeans
 import warnings

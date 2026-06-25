@@ -1,8 +1,8 @@
 # from locus_utils import process_locus
-from cstag_utils import parse_cstag
-from cigar_utils import parse_cigar
-from operation_utils import update_homopolymer_coords
-from locus_utils import locus_processor
+from inSTRbility.cstag_utils import parse_cstag
+from inSTRbility.cigar_utils import parse_cigar
+from inSTRbility.operation_utils import update_homopolymer_coords
+from inSTRbility.locus_utils import locus_processor
 
 import sys
 import pysam
