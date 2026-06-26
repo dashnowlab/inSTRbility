@@ -1818,7 +1818,14 @@ def diagnose_distribution(
     d_std  = float(deltas.std()) if n > 1 else 0.0
     d_max  = float(deltas.max())
     d_min  = float(deltas.min())
-    d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Precision loss occurred in moment calculation due to catastrophic cancellation.*",
+            category=RuntimeWarning,
+        )
+        d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
+        # s = skew(x)
 
     # Tail ratio: how many std deviations is the largest |delta|?
     tail_ratio = float(max(abs(d_max), abs(d_min)) / max(d_std, 1e-6))
@@ -2112,17 +2119,69 @@ def _compute_gof(
 
     regime2_recommended : bool
         True if ad_statistic > 100 OR ppp_variance < 0.05 OR
-        dispersion_ratio > 3.0. Composite flag combining the most sensitive
-        indicators of Regime 1 failure.
+        dispersion_ratio > 3.0 OR chisq_pvalue < 0.05. Composite flag
+        combining the most sensitive indicators of Regime 1 failure.
+
+    chisq_statistic : float
+        Pearson Chi-Square statistic computed over quantile-based bins of
+        the fitted distribution. Bins are defined by equal-probability
+        quantiles of the fitted PMF, so each bin has the same expected
+        count under the model. Adjacent bins are merged until all expected
+        counts are ≥ 5 (the standard Chi-Square validity requirement).
+        Lower is better. Unlike AD and KS, Chi-Square has a calibrated
+        null distribution (chi-squared with known df), making its p-value
+        formally interpretable.
+
+    chisq_pvalue : float [0, 1]
+        P-value under the chi-squared null distribution with
+        df = n_bins_used - 2 - 1 (subtracting 2 for the per-locus
+        estimated parameters r_e and r_c, and 1 for the constraint that
+        counts sum to n). Values below 0.05 indicate statistically
+        significant misfit. The most formally rigorous of the GoF metrics
+        for reporting in publications.
+
+    chisq_df : int
+        Degrees of freedom used for the chi-squared p-value.
+
+    chisq_n_bins : int
+        Number of bins after merging. Fewer bins = less powerful test.
+        If < 3, chi-square results are unreliable (reported as NaN).
     """
     rng    = np.random.default_rng(seed)
     deltas = np.asarray(deltas, dtype=int)
     n      = len(deltas)
 
-    # Fitted PMF at posterior mean parameters
-    lo = int(deltas.min()) - 5
-    hi = int(deltas.max()) + 5
+    # Degenerate case: all reads at the same length (zero variance).
+    # The model fits trivially but GoF metrics are undefined.
+    if np.all(deltas == deltas[0]):
+        return {
+            "ks_statistic":        0.0,
+            "ad_statistic":        0.0,
+            "ppp_variance":        0.5,
+            "ppp_skewness":        0.5,
+            "observed_var":        0.0,
+            "fitted_var":          0.0,
+            "dispersion_ratio":    1.0,
+            "chisq_statistic":     float("nan"),
+            "chisq_pvalue":        float("nan"),
+            "chisq_df":            0,
+            "chisq_n_bins":        0,
+            "regime2_recommended": 0,
+            "fit_quality":         float("nan"),
+            "fit_quality_adjusted": float("nan"),
+        }
+
+    # Fitted PMF at posterior mean parameters.
+    # Extend the range well beyond the observed deltas so the FFT grid
+    # captures enough probability mass for reliable sampling in the PPP step.
+    # Minimum span of 40 ensures ks_vals is never empty even for tight
+    # distributions where lo and hi would otherwise be equal or very close.
+    obs_span = max(int(deltas.max()) - int(deltas.min()), 1)
+    lo = int(deltas.min()) - max(5, obs_span)
+    hi = int(deltas.max()) + max(5, obs_span)
     N  = min(int(2**np.ceil(np.log2((hi - lo) * 3 + 32))), 8192)
+    N  = max(N, 64)
+
     t  = 2 * np.pi * np.arange(N) / N
     emi, ei = np.exp(-1j * t), np.exp(1j * t)
     M_sp = pp * emi / (1 - (1 - pp) * emi)
@@ -2135,8 +2194,15 @@ def _compute_gof(
     order   = np.argsort(dg); dg = dg[order]; pmf_raw = pmf_raw[order]
     mask    = (dg >= lo) & (dg <= hi)
     ks_vals = dg[mask]
-    pmf     = np.clip(pmf_raw[mask], 1e-300, None); pmf /= pmf.sum()
-    cdf     = np.cumsum(pmf)
+    pmf     = np.clip(pmf_raw[mask], 1e-300, None)
+
+    # Guard: if the mask produced no values fall back to the full sorted grid.
+    if len(ks_vals) == 0:
+        ks_vals = dg
+        pmf     = np.clip(pmf_raw, 1e-300, None)
+
+    pmf /= pmf.sum()
+    cdf  = np.cumsum(pmf)
 
     # Fitted mean and variance
     fitted_mean = float(np.sum(ks_vals * pmf))
@@ -2169,21 +2235,139 @@ def _compute_gof(
 
     disp_ratio = obs_var / max(fitted_var, 1e-6)
 
-    regime2_flag = (
-        ad_stat > 100.0 or
-        ppp_var < 0.05  or
-        disp_ratio > 3.0
+    # ── Chi-Square GoF with quantile-based binning ────────────────────────
+    # Bin edges are quantiles of the FITTED distribution so each bin has
+    # equal expected probability under the model. Bins with expected count
+    # < 5 are merged with their smallest neighbour until the requirement
+    # is met, then chi-square is computed with df = n_bins - 2 - 1.
+    chisq_stat = float('nan')
+    chisq_pval = float('nan')
+    chisq_df   = 0
+    chisq_bins = 0
+
+    if len(ks_vals) >= 3:
+        # Adaptive bin count: target ~5 reads per bin, min 5 bins max 10
+        # With 5 bins and 2 estimated per-locus params, df = 5-2-1 = 2 (minimum valid)
+        n_bins_target = min(10, max(5, n // 5))
+        fitted_cdf    = np.cumsum(pmf)
+
+        # Quantile bin edges from fitted CDF
+        quantile_probs = np.linspace(0, 1, n_bins_target + 1)
+        bin_edges = []
+        for q in quantile_probs:
+            idx = int(np.searchsorted(fitted_cdf, q))
+            idx = min(idx, len(ks_vals) - 1)
+            bin_edges.append(int(ks_vals[idx]))
+        bin_edges = sorted(set(bin_edges))
+
+        if len(bin_edges) >= 3:
+            inner = bin_edges[1:-1]          # interior cut points
+            n_b   = len(inner) + 1           # number of bins
+
+            # Observed counts per bin
+            obs_bins = np.digitize(deltas, inner)   # 0..n_b-1
+            obs_c = np.array(
+                [(obs_bins == b).sum() for b in range(n_b)], dtype=float
+            )
+
+            # Expected counts per bin from fitted PMF
+            exp_c = np.zeros(n_b)
+            for b in range(n_b):
+                if b == 0:
+                    mask_b = ks_vals <= inner[0]
+                elif b == n_b - 1:
+                    mask_b = ks_vals > inner[-1]
+                else:
+                    mask_b = (ks_vals > inner[b-1]) & (ks_vals <= inner[b])
+                exp_c[b] = float(pmf[mask_b].sum()) * n
+
+            # Merge bins with expected count < 5 into smallest neighbour
+            # until all bins satisfy the requirement or only 2 bins remain
+            while len(exp_c) > 2 and exp_c.min() < 5.0:
+                idx_min = int(np.argmin(exp_c))
+                if idx_min == 0:
+                    merge = 1
+                elif idx_min == len(exp_c) - 1:
+                    merge = len(exp_c) - 2
+                else:
+                    merge = (idx_min - 1
+                             if exp_c[idx_min-1] <= exp_c[idx_min+1]
+                             else idx_min + 1)
+                lo_m = min(idx_min, merge)
+                hi_m = max(idx_min, merge)
+                exp_c = np.concatenate([
+                    exp_c[:lo_m],
+                    [exp_c[lo_m] + exp_c[hi_m]],
+                    exp_c[hi_m+1:]
+                ])
+                obs_c = np.concatenate([
+                    obs_c[:lo_m],
+                    [obs_c[lo_m] + obs_c[hi_m]],
+                    obs_c[hi_m+1:]
+                ])
+
+            chisq_bins = len(exp_c)
+            if chisq_bins >= 2:
+                valid_b   = exp_c > 0
+                chisq_stat = float(
+                    np.sum((obs_c[valid_b] - exp_c[valid_b])**2
+                           / exp_c[valid_b])
+                )
+                # df = n_bins - n_estimated_params - 1
+                # n_estimated_params = 2 (r_e and r_c; p+/p- come from global)
+                # df = n_bins - n_estimated_params - 1
+                # Flag as unreliable (NaN) when fewer than 3 bins remain
+                # because df <= 0 gives a degenerate test
+                raw_df = chisq_bins - 2 - 1
+                # Require df >= 2: with df=1 the test has very low power
+                # and is prone to false positives from single bin imbalances
+                if raw_df < 2:
+                    chisq_stat = float('nan')
+                    chisq_pval = float('nan')
+                    chisq_df   = 0
+                else:
+                    chisq_df   = raw_df
+                    chisq_pval = float(
+                        1 - stats.chi2.cdf(chisq_stat, chisq_df)
+                    )
+
+    # Chi-square contributes to regime2 flag only when:
+    #   (a) the test is reliable (df >= 2, bins >= 3), AND
+    #   (b) the data is UNDERdispersed relative to the model (disp_ratio > 1)
+    # When the model is OVERdispersed (disp_ratio < 1), chi-square misfit
+    # means the global step-size priors are too loose for this locus -- a
+    # calibration issue, not a Regime 2 indication.
+    chisq_flag = (
+        not np.isnan(chisq_pval) and
+        chisq_df >= 2               and
+        chisq_bins >= 3             and
+        chisq_pval < 0.05           and
+        disp_ratio > 1.0               # only flag underdispersed model
     )
+    regime2_flag = (
+        ad_stat    > 100.0 or
+        ppp_var    < 0.05  or
+        disp_ratio > 3.0   or
+        chisq_flag
+    )
+    fit_quality = min(2*min(ppp_var, 1-ppp_var), 1)
+    fit_quality_adjusted = fit_quality*min(1, chisq_pval/0.05)
 
     return {
-        "ks_statistic":         round(ks_stat,  6),
-        "ad_statistic":         round(ad_stat,  4),
-        "ppp_variance":         round(ppp_var,  4),
-        "ppp_skewness":         round(ppp_skew, 4),
-        "observed_var":         round(obs_var,  4),
+        "ks_statistic":         round(ks_stat,   6),
+        "ad_statistic":         round(ad_stat,   4),
+        "ppp_variance":         round(ppp_var,   4),
+        "ppp_skewness":         round(ppp_skew,  4),
+        "observed_var":         round(obs_var,   4),
         "fitted_var":           round(fitted_var, 4),
         "dispersion_ratio":     round(disp_ratio, 4),
+        "chisq_statistic":      round(chisq_stat, 4) if not np.isnan(chisq_stat) else float('nan'),
+        "chisq_pvalue":         round(chisq_pval, 6) if not np.isnan(chisq_pval) else float('nan'),
+        "chisq_df":             chisq_df,
+        "chisq_n_bins":         chisq_bins,
         "regime2_recommended":  int(regime2_flag),
+        "fit_quality":          round(fit_quality, 4),
+        "fit_quality_adjusted": round(fit_quality_adjusted, 4)
     }
 
 
@@ -2454,7 +2638,10 @@ def write_tsv(
         "p_any_mutation","p_any_mutation_ci_lo","p_any_mutation_ci_hi",
         "gof_ks_statistic","gof_ad_statistic",
         "gof_ppp_variance","gof_ppp_skewness",
-        "gof_dispersion_ratio","gof_regime2_recommended",
+        "gof_dispersion_ratio",
+        "gof_chisq_statistic","gof_chisq_pvalue",
+        "gof_chisq_df","gof_chisq_n_bins",
+        "gof_regime2_recommended",
         "diag_tail_ratio","diag_skewness","diag_n_outliers","diag_is_heavy_tailed",
         "diag_recommended_regime",
         "elapsed_s","error",
@@ -2473,3 +2660,238 @@ def write_tsv(
             writer.writerow({k: row.get(k, "") for k in ordered})
 
     print(f"Written {len(all_rows)} rows to {output_path}")
+
+
+# ===========================================================================
+# SINGLE HAPLOTYPE CONVENIENCE FUNCTION
+# ===========================================================================
+
+def analyse_haplotype(
+    lengths,
+    founder_length: float,
+    global_params: Optional[Regime1GlobalParams] = None,
+    repeat_unit_length: int = 3,
+    stratum: Optional[str] = None,
+    haplotype_label: str = "haplotype",
+    mitotic_generations: Optional[float] = None,
+    n_ppp: int = 300,
+    tail_ratio_threshold: float = 5.0,
+    seed: int = 0,
+) -> dict:
+    """
+    Analyse one phased haplotype at one locus using Regime 1.
+
+    The simplest entry point — takes a list of allele lengths and the
+    founder length, returns a flat dict of all results including
+    goodness-of-fit metrics and a regime2 recommendation flag.
+
+    Parameters
+    ----------
+    lengths : list or array-like of float or int
+        Per-read allele lengths for this haplotype, e.g. [40.3, 41.0, 41.7].
+        Float values are rounded to the nearest integer repeat unit.
+    founder_length : float
+        Germline / founder allele length (L₀). This is the reference point
+        from which all length changes (Δ) are measured. Use the known
+        germline length from blood or parental data if available; otherwise
+        the modal observed length is a reasonable approximation.
+    global_params : Regime1GlobalParams, optional
+        Pre-estimated global step-size parameters from Pass 1. If not
+        supplied, defaults are constructed automatically from
+        repeat_unit_length or stratum.
+    repeat_unit_length : int
+        Length of the repeat motif in base pairs (used only when
+        global_params is None and stratum is None). Controls default
+        step-size priors:
+            1-3 bp → p₊ ≈ 0.60, p₋ ≈ 0.70  (small steps, STRs)
+            4-6 bp → p₊ ≈ 0.45, p₋ ≈ 0.55
+            7+ bp  → p₊ ≈ 0.30, p₋ ≈ 0.45  (larger steps, disease loci)
+    stratum : str, optional
+        Named repeat stratum (overrides repeat_unit_length when supplied).
+        Options: 'str_short', 'str_medium', 'str_long',
+                 'disease_cag', 'disease_cgg', 'disease_gaa', 'disease_ctg'.
+    haplotype_label : str
+        Label written into the output dict (default "haplotype").
+    mitotic_generations : float, optional
+        G — number of mitotic cell divisions from zygote to sampled tissue.
+        When supplied, per-division mutation rates are included in the output.
+        Typical values: blood (adult) 50-70, colon epithelium 1000-2000.
+    n_ppp : int
+        Simulations for the posterior predictive p-value (default 300).
+        Set to 0 to skip goodness-of-fit computation entirely (faster).
+    tail_ratio_threshold : float
+        max|Δ|/std(Δ) above which Regime 2 is recommended (default 5.0).
+    seed : int
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    dict with the following keys:
+
+    Identity
+        haplotype, n_reads, founder_length
+
+    NegBin parameters (posterior mean + 95% CI)
+        r_e, r_e_ci_lo, r_e_ci_hi
+        r_c, r_c_ci_lo, r_c_ci_hi
+        p_plus, p_plus_ci_lo, p_plus_ci_hi
+        p_minus, p_minus_ci_lo, p_minus_ci_hi
+        mu_N_expansion  (mean expansion events per lineage)
+        mu_N_contraction
+
+    Instability
+        instability_index, instability_index_ci_lo, instability_index_ci_hi
+        net_bias, net_bias_ci_lo, net_bias_ci_hi
+        p_expansion, p_expansion_ci_lo, p_expansion_ci_hi
+
+    Mutation rates (per lineage)
+        expansion_rate, expansion_rate_ci_lo, expansion_rate_ci_hi
+        contraction_rate, contraction_rate_ci_lo, contraction_rate_ci_hi
+        net_mutation_rate, net_mutation_rate_ci_lo, net_mutation_rate_ci_hi
+        p_any_mutation, p_any_mutation_ci_lo, p_any_mutation_ci_hi
+
+    Per-division rates (only when mitotic_generations is supplied)
+        expansion_rate_per_div, expansion_rate_per_div_ci_lo/hi
+        contraction_rate_per_div, contraction_rate_per_div_ci_lo/hi
+        net_rate_per_div, net_rate_per_div_ci_lo/hi
+        mitotic_generations
+
+    Goodness of fit (only when n_ppp > 0)
+        gof_ks_statistic      — KS distance between empirical and fitted CDF
+        gof_ad_statistic      — Anderson-Darling statistic (tail-sensitive)
+        gof_ppp_variance      — P(simulated var ≥ observed var); near 0 = bad fit
+        gof_ppp_skewness      — P(simulated skew ≥ observed skew)
+        gof_dispersion_ratio  — observed_var / fitted_var; near 1 = good fit
+        gof_regime2_recommended — 1 if model fit is poor and Regime 2 is needed
+
+    Diagnostics
+        diag_tail_ratio         — max|Δ|/std(Δ); > 5 suggests Regime 2
+        diag_skewness           — skewness of the Δ distribution
+        diag_n_outliers         — reads flagged as potential outliers
+        diag_is_heavy_tailed    — 1 if tail_ratio > threshold
+        diag_warnings           — list of warning strings
+
+    Timing
+        elapsed_s
+
+    Examples
+    --------
+    Basic usage:
+        result = analyse_haplotype([40, 41, 41, 42, 40, 43], founder_length=40)
+        print(result['instability_index'])
+
+    With known germline length and tissue type:
+        result = analyse_haplotype(
+            lengths=[55, 56, 57, 58, 56, 55, 60, 54],
+            founder_length=55.0,
+            stratum='disease_cag',
+            mitotic_generations=60.0,   # adult blood
+        )
+
+    Checking fit quality before trusting results:
+        if result['gof_regime2_recommended']:
+            print('WARNING: poor Regime 1 fit — consider Regime 2')
+        elif result['gof_ppp_variance'] > 0.1:
+            print('Acceptable fit')
+        else:
+            print('Good fit')
+    """
+    t0 = time.time()
+
+    # ── Build global params if not supplied ───────────────────────────────
+    if global_params is None:
+        if stratum is not None:
+            global_params = Regime1GlobalParams.from_stratum(stratum)
+        else:
+            global_params = Regime1GlobalParams.from_defaults(repeat_unit_length)
+
+    # ── Pre-fit diagnostics ───────────────────────────────────────────────
+    diag = diagnose_distribution(
+        lengths,
+        founder_length=founder_length,
+        tail_ratio_threshold=tail_ratio_threshold,
+    )
+
+    # ── Fit Regime 1 ──────────────────────────────────────────────────────
+    result = fit_locus_r1(
+        lengths,
+        founder_length=founder_length,
+        global_params=global_params,
+        haplotype_label=haplotype_label,
+        mitotic_generations=mitotic_generations,
+        seed=seed,
+    )
+
+    # ── Goodness of fit ───────────────────────────────────────────────────
+    gof = {}
+    if n_ppp > 0:
+        lengths_int = np.round(np.asarray(lengths)).astype(int)
+        deltas      = (lengths_int - int(round(founder_length))).astype(int)
+        gof = _compute_gof(
+            deltas,
+            r_e = result.r_e[0],
+            r_c = result.r_c[0],
+            pp  = result.p_plus[0],
+            pm  = result.p_minus[0],
+            qe  = global_params.q_e,
+            qc  = global_params.q_c,
+            n_ppp = n_ppp,
+            seed  = seed + 1,
+        )
+
+    # ── Assemble flat output dict ─────────────────────────────────────────
+    def _unpack(tup, name):
+        """Unpack a (mean, lo, hi) tuple into three named keys."""
+        return {
+            name:             tup[0],
+            name + "_ci_lo":  tup[1],
+            name + "_ci_hi":  tup[2],
+        }
+
+    out = {
+        "haplotype":      haplotype_label,
+        "n_reads":        result.n_reads,
+        "founder_length": result.founder_length,
+    }
+
+    # NegBin parameters
+    out.update(_unpack(result.r_e,           "r_e"))
+    out.update(_unpack(result.r_c,           "r_c"))
+    out.update(_unpack(result.p_plus,        "p_plus"))
+    out.update(_unpack(result.p_minus,       "p_minus"))
+    out.update(_unpack(result.mu_expansion,  "mu_N_expansion"))
+    out.update(_unpack(result.mu_contraction,"mu_N_contraction"))
+
+    # Instability
+    out.update(_unpack(result.instability_index, "instability_index"))
+    out.update(_unpack(result.net_bias,          "net_bias"))
+    out.update(_unpack(result.p_expansion,       "p_expansion"))
+
+    # Mutation rates (per lineage)
+    out.update(_unpack(result.expansion_rate,    "expansion_rate"))
+    out.update(_unpack(result.contraction_rate,  "contraction_rate"))
+    out.update(_unpack(result.net_mutation_rate, "net_mutation_rate"))
+    out.update(_unpack(result.p_any_mutation,    "p_any_mutation"))
+
+    # Per-division rates (only when G was supplied)
+    if mitotic_generations is not None:
+        out["mitotic_generations"] = mitotic_generations
+        if result.expansion_rate_per_div is not None:
+            out.update(_unpack(result.expansion_rate_per_div,   "expansion_rate_per_div"))
+            out.update(_unpack(result.contraction_rate_per_div, "contraction_rate_per_div"))
+            out.update(_unpack(result.net_rate_per_div,         "net_rate_per_div"))
+
+    # Goodness of fit
+    for k, v in gof.items():
+        out[f"gof_{k}"] = v
+
+    # Diagnostics
+    out["diag_tail_ratio"]      = round(diag.tail_ratio, 3)
+    out["diag_skewness"]        = round(diag.skewness, 3)
+    out["diag_n_outliers"]      = diag.n_outliers
+    out["diag_is_heavy_tailed"] = int(diag.is_heavy_tailed)
+    out["diag_warnings"]        = diag.warnings   # list of strings
+
+    out["elapsed_s"] = round(time.time() - t0, 3)
+
+    return out
