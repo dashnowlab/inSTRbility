@@ -128,10 +128,14 @@ logging.getLogger("pymc").setLevel(logging.ERROR)
 # Constants and grid defaults
 # ===========================================================================
 
-# Regime 1 per-locus 2D grid: (r_e, r_c) with narrow (p₊, p₋) grid around global
+# Regime 1 per-locus grid: (r_e, r_c) with narrow (p₊, p₋) grid around global
+# Log-spaced r grids give fine resolution at small values (most genome-wide
+# loci have few mutations per lineage, r ~ 0.01-0.5) while still covering
+# high-instability loci (r up to 8). Linear spacing would waste most grid
+# points in the high-r region where few loci actually live.
 # 25 × 25 × 7 × 7 = 30,625 grid points, ~150ms per locus
-DEFAULT_RE_GRID  = np.linspace(0.1, 8.0, 25)   # expansion NegBin dispersion
-DEFAULT_RC_GRID  = np.linspace(0.1, 6.0, 25)   # contraction NegBin dispersion
+DEFAULT_RE_GRID  = np.exp(np.linspace(np.log(0.01), np.log(8.0), 25))  # log-spaced
+DEFAULT_RC_GRID  = np.exp(np.linspace(np.log(0.01), np.log(6.0), 25))  # log-spaced
 DEFAULT_PP_N     = 7     # number of p₊ grid points around global estimate
 DEFAULT_PM_N     = 7     # number of p₋ grid points around global estimate
 DEFAULT_P_LOG_SD = 0.2   # prior SD in log-odds space for p₊ and p₋ grids
@@ -276,6 +280,136 @@ class Regime1GlobalParams:
         pp, pm = STRATA[stratum]
         return cls(lp0=logit(pp), lp1=0.0, lm0=logit(pm), lm1=0.0,
                    q_e=q_e, q_c=q_c, n_loci_used=0)
+
+    @classmethod
+    def calibrate_from_results(
+        cls,
+        results_tsv: str,
+        base_params: "Regime1GlobalParams",
+        min_reads: int = 20,
+        target_percentile: float = 50,
+    ) -> "Regime1GlobalParams":
+        """
+        Adjust q_e and q_c from observed dispersion ratios in a results TSV.
+
+        When the model is systematically overdispersed (median dispersion_ratio
+        < 1, median PPP_var > 0.9), the NegBin count distribution is predicting
+        too many mutation events per lineage. This method back-calculates the q
+        value that aligns the model's expected variance with the typical observed
+        variance in your data.
+
+        The adjustment is derived from:
+            dispersion_ratio = observed_var / fitted_var
+                             ≈ (actual mutation rate) / (assumed mutation rate)
+
+        If dispersion_ratio = 0.19 (your case), the model is predicting ~5×
+        too many events. Increasing q from 0.5 to ~0.83 reduces the expected
+        count by that factor, realigning the model with your data.
+
+        Parameters
+        ----------
+        results_tsv : str
+            Path to TSV from write_tsv() or analyse_genome_wide().
+        base_params : Regime1GlobalParams
+            Starting parameters. p₊ and p₋ are kept; only q is adjusted.
+        min_reads : int
+            Only use loci with at least this many reads (default 20).
+            Low-depth loci have unstable dispersion ratio estimates.
+        target_percentile : float
+            Percentile of dispersion ratio to target (default 50 = median).
+            Using the median is robust to the extreme outliers at the tails
+            (very stable loci and very unstable loci).
+
+        Returns
+        -------
+        Regime1GlobalParams with adjusted q_e and q_c.
+
+        Usage
+        -----
+        # Run once on your initial results, then rerun analysis with new params
+        gp_initial = Regime1GlobalParams.from_defaults(repeat_unit_length=3)
+        results = analyse_genome_wide(catalog, gp_initial, ...)
+        write_tsv(results, 'initial_results.tsv')
+
+        gp_calibrated = Regime1GlobalParams.calibrate_from_results(
+            'initial_results.tsv', gp_initial
+        )
+        print(gp_calibrated)   # check new q value
+
+        results2 = analyse_genome_wide(catalog, gp_calibrated, ...)
+        write_tsv(results2, 'calibrated_results.tsv')
+        """
+        import copy
+        try:
+            import pandas as pd
+            df = pd.read_csv(results_tsv, sep="\t")
+        except ImportError:
+            import csv
+            rows = []
+            with open(results_tsv) as f:
+                for row in csv.DictReader(f, delimiter="\t"):
+                    rows.append(row)
+            df_data = {k: [] for k in rows[0]} if rows else {}
+            for row in rows:
+                for k, v in row.items():
+                    try: df_data[k].append(float(v))
+                    except (ValueError, TypeError): df_data[k].append(v)
+            class _DF:
+                def __init__(self, d): self._d = d
+                def __getitem__(self, k): return np.array(self._d[k])
+                def __len__(self): return len(next(iter(self._d.values())))
+            df = _DF(df_data)
+
+        try:
+            n_reads = np.array(df["n_reads"], dtype=float)
+            disp    = np.array(df["gof_dispersion_ratio"], dtype=float)
+        except (KeyError, TypeError):
+            raise ValueError(
+                "results_tsv must contain 'n_reads' and 'gof_dispersion_ratio' columns. "
+                "Ensure write_tsv() was used to generate the file."
+            )
+
+        # Filter to reliable loci
+        valid = (n_reads >= min_reads) & np.isfinite(disp) & (disp > 0)
+        if valid.sum() < 10:
+            raise ValueError(
+                f"Only {valid.sum()} loci pass filters (n_reads >= {min_reads}, "
+                f"valid dispersion_ratio). Need at least 10 for calibration."
+            )
+
+        target_ratio = float(np.percentile(disp[valid], target_percentile))
+        current_q    = base_params.q_e
+
+        # Back-calculate q from dispersion ratio.
+        # At fixed r and p, Var(Delta) ∝ (1-q)/q  (the NB overdispersion).
+        # If observed_var = target_ratio × fitted_var, we need to scale
+        # (1-q)/q by target_ratio to match:
+        #   new_rate = current_rate × target_ratio
+        #   new_q    = 1 / (1 + new_rate)
+        current_rate = (1.0 - current_q) / current_q
+        new_rate     = current_rate * target_ratio
+        new_q        = float(np.clip(1.0 / (1.0 + new_rate), 0.05, 0.99))
+
+        n_overdispersed   = int((disp[valid] > 1.5).sum())
+        n_underdispersed  = int((disp[valid] < 0.67).sum())
+        n_good            = int(valid.sum()) - n_overdispersed - n_underdispersed
+
+        print(f"Calibration summary ({int(valid.sum())} loci with n >= {min_reads}):")
+        print(f"  Dispersion ratio at {target_percentile}th percentile: {target_ratio:.4f}")
+        print(f"  {'Model overdispersed' if target_ratio < 1 else 'Model underdispersed'} "
+              f"({'fitted_var > observed_var' if target_ratio < 1 else 'fitted_var < observed_var'})")
+        print(f"  Loci breakdown: {n_good} well-fit, "
+              f"{n_overdispersed} underdispersed, {n_underdispersed} overdispersed")
+        print(f"  q adjusted: {current_q:.3f} → {new_q:.3f}")
+        print(f"  Effect: mean mutation count per lineage "
+              f"{'reduced' if new_q > current_q else 'increased'} "
+              f"by factor {target_ratio:.2f}")
+        print(f"  Expected PPP_var after calibration: median should shift toward 0.5")
+
+        new_params     = copy.deepcopy(base_params)
+        new_params.q_e = new_q
+        new_params.q_c = new_q
+        return new_params
 
     def __repr__(self) -> str:
         return (
@@ -1818,14 +1952,7 @@ def diagnose_distribution(
     d_std  = float(deltas.std()) if n > 1 else 0.0
     d_max  = float(deltas.max())
     d_min  = float(deltas.min())
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Precision loss occurred in moment calculation due to catastrophic cancellation.*",
-            category=RuntimeWarning,
-        )
-        d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
-        # s = skew(x)
+    d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
 
     # Tail ratio: how many std deviations is the largest |delta|?
     tail_ratio = float(max(abs(d_max), abs(d_min)) / max(d_std, 1e-6))
@@ -1933,7 +2060,7 @@ def auto_fit(
     mitotic_generations: Optional[float] = None,
     seed: int = 0,
     **kwargs,
-) -> tuple:
+) -> tuple[object, "DistributionDiagnostics", Optional[dict]]:
     """
     Automatically diagnose the read-length distribution and route to the
     appropriate regime.
@@ -1972,7 +2099,20 @@ def auto_fit(
 
     Returns
     -------
-    (result, diagnostics) : (Regime1Result or Regime2Result, DistributionDiagnostics)
+    (result, diagnostics, gof) :
+        result      : Regime1Result or Regime2Result
+        diagnostics : DistributionDiagnostics
+        gof         : dict or None
+            Goodness-of-fit metrics for Regime 1 fits (same keys as
+            _compute_gof: ks_statistic, ad_statistic, ppp_variance,
+            ppp_skewness, observed_var, fitted_var, dispersion_ratio,
+            chisq_statistic, chisq_pvalue, chisq_df, chisq_n_bins,
+            regime2_recommended, fit_quality, fit_quality_adjusted).
+            None for Regime 2 fits (GoF not meaningful for simulation-based
+            inference) or if GoF computation failed.
+
+    Note: n_ppp (number of PPP simulations, default 300) can be passed
+    via **kwargs to control GoF computation speed.
     """
     diag = diagnose_distribution(
         lengths, founder_length,
@@ -1981,9 +2121,11 @@ def auto_fit(
     )
 
     lengths_fit = np.asarray(lengths)
+    gof         = None   # populated only for Regime 1 fits
 
     if diag.is_heavy_tailed and regime2_params is not None:
-        # Route to Regime 2
+        # Route to Regime 2 — GoF not computed (Regime 2 uses simulation-based
+        # inference so the NB-Geometric GoF metrics are not meaningful)
         result = fit_locus_r2(
             lengths_fit, founder_length, regime2_params,
             haplotype_label=haplotype_label, seed=seed, **kwargs
@@ -1995,6 +2137,10 @@ def auto_fit(
                 "Running Regime 1 with adaptive grid — results will underestimate "
                 "instability. Supply regime2_params for correct inference."
             )
+        # Extract n_ppp before forwarding kwargs to fit_locus_r1
+        # so it does not cause an unexpected keyword argument error
+        n_ppp = kwargs.pop("n_ppp", 300)
+
         # Optionally filter outliers before Regime 1
         if filter_outliers_r1 and diag.n_outliers > 0:
             lengths_fit, removed = filter_outliers(
@@ -2011,7 +2157,29 @@ def auto_fit(
             seed=seed, **kwargs
         )
 
-    return result, diag
+        # Goodness-of-fit for Regime 1 fits
+        # n_ppp=0 means skip GoF entirely (useful for speed when not needed)
+        if n_ppp == 0:
+            gof = None
+        else:
+            try:
+                lengths_int = np.round(lengths_fit).astype(int)
+                deltas      = (lengths_int - int(round(result.founder_length))).astype(int)
+                gof = _compute_gof(
+                    deltas,
+                    r_e = result.r_e[0],
+                    r_c = result.r_c[0],
+                    pp  = result.p_plus[0],
+                    pm  = result.p_minus[0],
+                    qe  = regime1_params.q_e,
+                    qc  = regime1_params.q_c,
+                    n_ppp = n_ppp,
+                    seed  = seed + 1,
+                )
+            except Exception as e:
+                diag.warnings.append(f"GoF computation failed: {e}")
+
+    return result, diag, gof
 
 
 # ===========================================================================
@@ -2168,7 +2336,7 @@ def _compute_gof(
             "chisq_n_bins":        0,
             "regime2_recommended": 0,
             "fit_quality":         float("nan"),
-            "fit_quality_adjusted": float("nan"),
+            "fit_quality_adjusted":float("nan"),
         }
 
     # Fitted PMF at posterior mean parameters.
@@ -2230,8 +2398,12 @@ def _compute_gof(
         sim_vars[i]  = float(np.var(sim_d))
         sim_skews[i] = float(stats.skew(sim_d.astype(float))) if n > 2 else 0.0
 
-    ppp_var  = float((sim_vars  >= obs_var).mean())
-    ppp_skew = float((sim_skews >= obs_skew).mean())
+    if n_ppp == 0:
+        ppp_var  = 0.5   # neutral value when PPP not computed
+        ppp_skew = 0.5
+    else:
+        ppp_var  = float((sim_vars  >= obs_var).mean())
+        ppp_skew = float((sim_skews >= obs_skew).mean())
 
     disp_ratio = obs_var / max(fitted_var, 1e-6)
 
@@ -2350,8 +2522,52 @@ def _compute_gof(
         disp_ratio > 3.0   or
         chisq_flag
     )
-    fit_quality = min(2*min(ppp_var, 1-ppp_var), 1)
-    fit_quality_adjusted = fit_quality*min(1, chisq_pval/0.05)
+
+    # ── Asymmetric fit quality score ─────────────────────────────────────
+    # Standard formula 2*min(PPP,1-PPP) penalises mild overdispersion
+    # (PPP_var 0.7-0.9) which is common and expected for stable loci in
+    # genome-wide catalogs — the prior prevents r from going to zero so
+    # the model is always slightly wider than a perfectly stable locus.
+    # This asymmetric formula treats mild overdispersion as acceptable
+    # while still penalising severe overdispersion and all underdispersion.
+    #
+    # Underdispersion (PPP_var 0 → 0.5): linear 0 → 1.0
+    # Mild overdispersion (PPP_var 0.5 → 0.90): stays at 1.0
+    # Severe overdispersion (PPP_var 0.90 → 1.0): drops 1.0 → 0.5
+    if ppp_var <= 0.5:
+        fq_base = 2.0 * ppp_var                              # 0 at PPP=0, 1 at PPP=0.5
+    elif ppp_var <= 0.90:
+        fq_base = 1.0                                        # acceptable overdispersion
+    else:
+        fq_base = 1.0 - 0.5 * (ppp_var - 0.90) / 0.10      # gentle penalty 1.0→0.5
+
+    # AD penalty: tail misfit degrades score
+    # AD < 5: no penalty.  AD 5-100: linear to 0.5×.  AD > 100: severe.
+    if ad_stat <= 5.0:
+        ad_factor = 1.0
+    elif ad_stat <= 100.0:
+        ad_factor = 1.0 - 0.5 * (ad_stat - 5.0) / 95.0
+    else:
+        ad_factor = max(0.5 * float(np.exp(-0.01 * (ad_stat - 100.0))), 0.0)
+
+    fit_quality = float(np.clip(fq_base * ad_factor, 0.0, 1.0))
+
+    # Chi-square adjusted score: only penalise when underdispersed and
+    # chi-square is reliable (df >= 2, bins >= 3).
+    # Overdispersed chi-square misfit is a calibration issue, not Regime 2.
+    if (not np.isnan(chisq_pval) and
+            chisq_df >= 2 and chisq_bins >= 3 and
+            chisq_pval < 0.05 and ppp_var < 0.5):
+        fq_adj = fit_quality * min(1.0, chisq_pval / 0.05)
+        ad_factor            = 1.0 if ad_stat <= 5 else (1.0 - 0.5*(ad_stat-5)/95 if ad_stat <= 100 else max(0.5*np.exp(-0.01*(ad_stat-100)), 0.0))
+        fit_quality          = min(2*ppp_var, 1.0) * ad_factor if ppp_var <= 0.5 else ((1.0 if ppp_var <= 0.9 else 1.0 - 0.5*(ppp_var-0.9)/0.1) * ad_factor)
+        fq_adj = fit_quality * min(1.0, chisq_pval/0.05) if (chisq_pval==chisq_pval and chisq_df>=2 and chisq_bins>=3 and chisq_pval<0.05 and ppp_var<0.5) else fit_quality
+    else:
+
+        ad_factor            = 1.0 if ad_stat <= 5 else (1.0 - 0.5*(ad_stat-5)/95 if ad_stat <= 100 else max(0.5*np.exp(-0.01*(ad_stat-100)), 0.0))
+        fit_quality          = min(2*ppp_var, 1.0) * ad_factor if ppp_var <= 0.5 else ((1.0 if ppp_var <= 0.9 else 1.0 - 0.5*(ppp_var-0.9)/0.1) * ad_factor)
+        fq_adj = fit_quality
+
 
     return {
         "ks_statistic":         round(ks_stat,   6),
@@ -2367,7 +2583,7 @@ def _compute_gof(
         "chisq_n_bins":         chisq_bins,
         "regime2_recommended":  int(regime2_flag),
         "fit_quality":          round(fit_quality, 4),
-        "fit_quality_adjusted": round(fit_quality_adjusted, 4)
+        "fit_quality_adjusted": round(fq_adj,       4),
     }
 
 
@@ -2884,6 +3100,20 @@ def analyse_haplotype(
     # Goodness of fit
     for k, v in gof.items():
         out[f"gof_{k}"] = v
+
+    # Composite fit quality scores
+    ppp_v = gof.get("ppp_variance", 0.5) if gof else 0.5
+    chisq_p = gof.get("chisq_pvalue", float("nan")) if gof else float("nan")
+    chisq_df_val = gof.get("chisq_df", 0) if gof else 0
+
+    # Use the same asymmetric formula as _compute_gof:
+    # mild overdispersion (PPP 0.5-0.9) is acceptable for stable loci
+    if gof:
+        out["fit_quality"]          = gof.get("fit_quality", 0.0)
+        out["fit_quality_adjusted"] = gof.get("fit_quality_adjusted", 0.0)
+    else:
+        out["fit_quality"]          = 0.0
+        out["fit_quality_adjusted"] = 0.0
 
     # Diagnostics
     out["diag_tail_ratio"]      = round(diag.tail_ratio, 3)
