@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Prevent OpenBLAS fork-deadlock: must be set BEFORE numpy/scipy import.
+import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 """
 calc_instability.py  —  Somatic Tandem-Repeat Instability Analysis
 ===================================================================
@@ -577,6 +582,9 @@ def _r1_worker(
     n_ppp:     int,
 ) -> None:
     """Process a chunk of loci with R1 and write TSV rows."""
+    import os
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
     out = open(fout, "wt")
     if thread_id == 0:
         print("\t".join(_R1_COLS), file=out)
@@ -626,7 +634,6 @@ def _r1_worker(
             )))
             wmad  = winsorized_mean_abs_delta(lengths, result.founder_length)
 
-            print(gof, file=sys.stderr)
             row = [
                 chrom, start, end, motif, hap, "R1",
                 round(result.founder_length, 4),
@@ -799,8 +806,9 @@ def _r2_worker(
     n_quad:      int,
 ) -> None:
     """Process a chunk of Regime 2 loci and write TSV rows."""
-    # TISSUE_AGE_PRIORS and _marginalised_pmf imported at module level
-
+    import os
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
     out = open(fout, "wt")
     if thread_id == 0:
         print("\t".join(_R2_COLS), file=out)
@@ -829,7 +837,6 @@ def _r2_worker(
         t0      = time.time()
 
         try:
-            print(f"R2 {chrom}:{start} hap{hap}: "f"founder={founder:.1f}, n={len(lengths)}", file=sys.stderr)
             result = fit_locus_marginal(
                 lengths,
                 founder_length  = founder,
