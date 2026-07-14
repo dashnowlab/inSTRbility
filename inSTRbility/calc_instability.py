@@ -113,6 +113,12 @@ def _parse_args() -> argparse.Namespace:
                     help="Min reads per haplotype (default: 10)")
     r1.add_argument("--n-ppp",     type=int, default=300,
                     help="PPP simulations for R1 GoF (default: 300; 0=skip)")
+    r1.add_argument("--calibrate",  action="store_true",
+                    help="Run Phase 2B: recalibrate q from Phase 2 dispersion "
+                         "ratios and rerun Phase 2 with corrected params. "
+                         "Recommended for first-run on any new sample.")
+    r1.add_argument("--calibrate-min-reads", type=int, default=20,
+                    help="Min reads per locus for calibration (default: 20)")
 
     r2 = p.add_argument_group("Regime 2 options")
     r2.add_argument("--run-regime2",    action="store_true",
@@ -136,7 +142,7 @@ def _parse_args() -> argparse.Namespace:
                     help="Workers for R2 inference. Defaults to --threads.")
     r2.add_argument("--r2-n-ppp",         type=int, default=200,
                     help="PPP simulations for R2 GoF (default: 200; 0=skip)")
-    r2.add_argument("--r2-n-quad",        type=int, default=3,
+    r2.add_argument("--r2-n-quad",        type=int, default=15,
                     help="Age quadrature points for R2 (default: 15)")
     return p.parse_args()
 
@@ -178,12 +184,12 @@ def load_genotypes_from_vcf(vcf_path: str) -> dict:
     for v in cyvcf2.VCF(vcf_path):
         if v.FILTER not in ("PASS", None):
             continue
-        motif = v.INFO.get("MOTIF", "")
+        motif = v.INFO.get("MOTIFS", "")
         if not motif:
             continue
         al = v.format("AL")
         if al is not None and len(al):
-            key = f"{v.CHROM}:{v.start}-{v.INFO.get('END')}_{motif}"
+            key = f"{v.CHROM}:{v.start}-{v.INFO.get('END')+1}_{motif}"
             genotypes[key] = al[0] / len(motif)
     print(f"Loaded {len(genotypes)} VCF genotypes in {time.time()-t0:.1f}s",
           file=sys.stderr)
@@ -486,7 +492,7 @@ def parse_input_tsv(
                                "end": end,   "motif": motif})
 
         hap  = int(haplotype)
-        unit = float(length_bp) / ml
+        unit = float(length_bp) # / ml
 
         if key != prev_key and prev_key is not None:
             _flush(data, info, prev_key, haps, genotypes)
@@ -568,6 +574,108 @@ def run_r1_pass1(catalog: list, min_reads: int = 10) -> dict:
             gp_map[s] = estimate_regime1_global(entries, min_reads=min_reads)
             print(f"    {gp_map[s]}", file=sys.stderr)
     return gp_map
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B — Regime 1 q recalibration (optional)
+# ---------------------------------------------------------------------------
+
+def run_r1_calibration(
+    gp_map:    dict,
+    r1_tsv:    str,
+    min_reads: int = 20,
+) -> dict:
+    """
+    Phase 2B: Recalibrate the NegBin q parameter per stratum from the
+    dispersion ratios in the Phase 2 output TSV.
+
+    The NB-Geometric model has a q parameter controlling how many mutation
+    events occur per cell lineage. If q is wrong, the model's fitted variance
+    systematically differs from the observed variance:
+
+      dispersion_ratio = observed_var / fitted_var
+      median < 1 → model overpredicts variance → increase q
+      median > 1 → model underpredicts variance → decrease q
+
+    This method reads gof_dispersion_ratio from the TSV, computes the
+    median per stratum (filtering by n_reads >= min_reads and regime=R1),
+    and back-calculates the q that would bring the median to 1.0.
+
+    Calibration is per-stratum because motif length strongly affects the
+    somatic mutation rate and thus the appropriate q:
+      Short motifs (1-4bp): typically need higher q (fewer events per lineage)
+      Long motifs  (5-6bp): typically well-calibrated at the initial q
+
+    Parameters
+    ----------
+    gp_map : dict
+        {stratum: Regime1GlobalParams} from run_r1_pass1().
+    r1_tsv : str
+        Path to Phase 2 output TSV.
+    min_reads : int
+        Minimum reads per locus to use in calibration (default: 20).
+        Low-depth loci have noisy dispersion ratios.
+
+    Returns
+    -------
+    dict : calibrated {stratum: Regime1GlobalParams}
+    """
+    import csv
+
+    # Read dispersion ratios and n_reads per stratum from TSV
+    stratum_disp: dict[int, list] = {3: [], 6: [], 7: []}
+    try:
+        with open(r1_tsv) as f:
+            for row in csv.DictReader(f, delimiter="\t"):
+                try:
+                    n   = int(float(row["n_reads"]))
+                    dr  = float(row["gof_dispersion_ratio"])
+                    ml  = len(row["motif"])
+                    reg = row.get("regime", "R1")
+                except (ValueError, KeyError):
+                    continue
+                if not (n >= min_reads and np.isfinite(dr) and dr > 0
+                        and reg == "R1"):
+                    continue
+                s = get_stratum(ml)
+                if s in stratum_disp:
+                    stratum_disp[s].append(dr)
+    except FileNotFoundError:
+        print(f"  Calibration: {r1_tsv} not found, skipping.", file=sys.stderr)
+        return gp_map
+
+    labels = {3: "1-3bp", 6: "4-6bp", 7: "7+bp"}
+    new_gp_map = {}
+    import copy
+
+    for stratum, gp in gp_map.items():
+        disp_vals = stratum_disp.get(stratum, [])
+        if len(disp_vals) < 5:
+            print(f"  Stratum {labels[stratum]}: too few loci ({len(disp_vals)}) "
+                  f"for calibration — keeping q={gp.q_e:.3f}", file=sys.stderr)
+            new_gp_map[stratum] = gp
+            continue
+
+        median_dr = float(np.median(disp_vals))
+
+        # Back-calculate new q.
+        # NB variance ∝ (1-q)/q.  We want new_var = old_var * median_dr.
+        # => new_rate = old_rate * median_dr  where rate = (1-q)/q
+        current_rate = (1.0 - gp.q_e) / gp.q_e
+        new_rate     = current_rate * median_dr
+        new_q        = float(np.clip(1.0 / (1.0 + new_rate), 0.05, 0.99))
+
+        direction = ("overpredicts" if median_dr < 1 else "underpredicts")
+        print(f"  Stratum {labels[stratum]} (n={len(disp_vals)}): "
+              f"median disp_ratio={median_dr:.3f} — model {direction} variance "
+              f"→ q: {gp.q_e:.3f} → {new_q:.3f}", file=sys.stderr)
+
+        new_gp = copy.deepcopy(gp)
+        new_gp.q_e = new_q
+        new_gp.q_c = new_q
+        new_gp_map[stratum] = new_gp
+
+    return new_gp_map
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +917,7 @@ def _r2_worker(
     import os
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
+    # TISSUE_AGE_PRIORS and _marginalised_pmf imported at module level
     out = open(fout, "wt")
     if thread_id == 0:
         print("\t".join(_R2_COLS), file=out)
@@ -844,8 +953,8 @@ def _r2_worker(
                 donor_age       = donor_age,
                 tissue_type     = tissue_type,
                 n_quad          = n_quad,
-                r1_n            = 20,
-                r2_n            = 10,
+                r1_n            = 30,
+                r2_n            = 12,
                 haplotype_label = f"hap{hap}",
             )
         except Exception as e:
@@ -858,10 +967,18 @@ def _r2_worker(
         obs_max     = int(lengths_int.max())
         obs_min     = int(lengths_int.min())
         obs_span    = max(obs_max - L0_int, L0_int - obs_min, 1)
-        min_L       = min(max(obs_min - 10, 0), L0_int)  # must not exceed L0
-        max_L       = min(min_L + 79,  # cap at 80 states, matches fit_locus_marginal
-                          obs_max + max(30, obs_span // 2),
-                          1000)
+        # min_L must not exceed L0 (L0 must be inside the state space)
+        min_L = min(max(obs_min - 10, 0), L0_int)
+
+        # Adaptive cap: cover observed data but limit matrix size
+        # Cap chosen so n_states = max_L - min_L + 1 stays manageable.
+        # obs_max + 30 buffer, but hard cap at min_L + 150 (151 states max).
+        # Reads beyond max_L go into the absorbing sink -- same as Handsaker et al.
+        max_L = min(
+            obs_max + 30,           # cover observed data with small buffer
+            min_L + 150,            # hard cap: n_states ≤ 151
+            1000,                   # absolute ceiling
+        )
 
         gof2 = _compute_r2_gof(
             observed_lengths = np.asarray(lengths, float),
@@ -1048,6 +1165,36 @@ if __name__ == "__main__":
     r1_pbar.close()
     print(f"  R1 results → {r1_out}", file=sys.stderr)
 
+    # ── Phase 2B: q recalibration (optional) ────────────────────────────────
+    if args.calibrate:
+        print("\nPhase 2B: recalibrating q from Phase 2 dispersion ratios...",
+              file=sys.stderr)
+        gp_map_cal = run_r1_calibration(
+            gp_map, r1_out, min_reads=args.calibrate_min_reads
+        )
+        # Check whether any stratum actually changed
+        changed = any(
+            abs(gp_map_cal[s].q_e - gp_map[s].q_e) > 0.005
+            for s in gp_map
+        )
+        if changed:
+            print("  Re-running Phase 2 with calibrated params...",
+                  file=sys.stderr)
+            r2_pbar_cal = tqdm(
+                unit="chunks" if args.threads > 1 else "loci",
+                total=args.threads if args.threads > 1 else len(catalog),
+                unit_scale=True, ncols=80, smoothing=0.1,
+                position=2, desc="R1 (calibrated)",
+            )
+            _run_r1(catalog, gp_map_cal, r1_out,
+                    args.threads, args.n_ppp, r2_pbar_cal)
+            r2_pbar_cal.close()
+            gp_map = gp_map_cal   # use calibrated params for all downstream phases
+            print(f"  Calibrated R1 results → {r1_out}", file=sys.stderr)
+        else:
+            print("  q unchanged (<0.005 difference) — skipping rerun.",
+                  file=sys.stderr)
+
     if not args.run_regime2:
         import shutil
         shutil.copy(r1_out, final_out)
@@ -1119,3 +1266,8 @@ if __name__ == "__main__":
     print("\nPhase 6: merging results...", file=sys.stderr)
     merge_results(r1_out, r2_out, final_out)
     print(f"\nDone. Final output: {final_out}", file=sys.stderr)
+
+# 8668970161  - Domestic
+# 12679411037 - International
+# 1004028383
+# 8008291040

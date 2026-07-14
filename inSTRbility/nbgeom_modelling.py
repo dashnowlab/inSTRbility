@@ -1952,7 +1952,9 @@ def diagnose_distribution(
     d_std  = float(deltas.std()) if n > 1 else 0.0
     d_max  = float(deltas.max())
     d_min  = float(deltas.min())
-    d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        d_skew = float(_skew_fn(deltas)) if n > 2 else 0.0
 
     # Tail ratio: how many std deviations is the largest |delta|?
     tail_ratio = float(max(abs(d_max), abs(d_min)) / max(d_std, 1e-6))
@@ -2396,7 +2398,9 @@ def _compute_gof(
     for i in range(n_ppp):
         sim_d        = rng.choice(ks_vals, size=n, p=pmf)
         sim_vars[i]  = float(np.var(sim_d))
-        sim_skews[i] = float(stats.skew(sim_d.astype(float))) if n > 2 else 0.0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            sim_skews[i] = float(stats.skew(sim_d.astype(float))) if n > 2 else 0.0
 
     if n_ppp == 0:
         ppp_var  = 0.5   # neutral value when PPP not computed
@@ -2559,15 +2563,8 @@ def _compute_gof(
             chisq_df >= 2 and chisq_bins >= 3 and
             chisq_pval < 0.05 and ppp_var < 0.5):
         fq_adj = fit_quality * min(1.0, chisq_pval / 0.05)
-        ad_factor            = 1.0 if ad_stat <= 5 else (1.0 - 0.5*(ad_stat-5)/95 if ad_stat <= 100 else max(0.5*np.exp(-0.01*(ad_stat-100)), 0.0))
-        fit_quality          = min(2*ppp_var, 1.0) * ad_factor if ppp_var <= 0.5 else ((1.0 if ppp_var <= 0.9 else 1.0 - 0.5*(ppp_var-0.9)/0.1) * ad_factor)
-        fq_adj = fit_quality * min(1.0, chisq_pval/0.05) if (chisq_pval==chisq_pval and chisq_df>=2 and chisq_bins>=3 and chisq_pval<0.05 and ppp_var<0.5) else fit_quality
     else:
-
-        ad_factor            = 1.0 if ad_stat <= 5 else (1.0 - 0.5*(ad_stat-5)/95 if ad_stat <= 100 else max(0.5*np.exp(-0.01*(ad_stat-100)), 0.0))
-        fit_quality          = min(2*ppp_var, 1.0) * ad_factor if ppp_var <= 0.5 else ((1.0 if ppp_var <= 0.9 else 1.0 - 0.5*(ppp_var-0.9)/0.1) * ad_factor)
         fq_adj = fit_quality
-
 
     return {
         "ks_statistic":         round(ks_stat,   6),
@@ -3073,6 +3070,8 @@ def analyse_haplotype(
     # NegBin parameters
     out.update(_unpack(result.r_e,           "r_e"))
     out.update(_unpack(result.r_c,           "r_c"))
+    out["q_e"] = global_params.q_e
+    out["q_c"] = global_params.q_c
     out.update(_unpack(result.p_plus,        "p_plus"))
     out.update(_unpack(result.p_minus,       "p_minus"))
     out.update(_unpack(result.mu_expansion,  "mu_N_expansion"))
@@ -3114,6 +3113,17 @@ def analyse_haplotype(
     else:
         out["fit_quality"]          = 0.0
         out["fit_quality_adjusted"] = 0.0
+
+    # Winsorized mean absolute delta (matches Handsaker et al. definition)
+    # Directly from observed reads, not from the model
+    abs_deltas = np.abs(
+        np.round(np.asarray(lengths)).astype(int) - int(round(founder_length))
+    ).astype(float)
+    winsor_threshold = 100.0   # 100 repeat units, matching Handsaker et al. Fig. SN2.3
+    out["winsorized_mean_abs_delta"] = round(
+        float(np.minimum(abs_deltas, winsor_threshold).mean()), 4
+    )
+    out["winsor_threshold"] = winsor_threshold
 
     # Diagnostics
     out["diag_tail_ratio"]      = round(diag.tail_ratio, 3)
