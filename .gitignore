@@ -1,2 +1,4 @@
 /test_data/*
 /archive/*
+/inSTRbility/__pycache__/*
+.DS_Store
