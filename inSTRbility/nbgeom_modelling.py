@@ -34,66 +34,16 @@ Instability index (closed form):
   Var(Δ) = μ_{N_e}·(1−p₊)/p₊² + σ²_{N_e}/p₊²
           + μ_{N_c}·(1−p₋)/p₋² + σ²_{N_c}/p₋²
 
-─────────────────────────────────────────────────────────────────────────────
-REGIME 2 — Large somatic excursions (|Δ| comparable to L₀)
-─────────────────────────────────────────────────────────────────────────────
-For loci like FMR1 (CGG), HTT (CAG large expansions), FRDA (GAA), where
-somatic expansions can be many times the founder allele length. The
-step-size distribution changes as the allele lengthens — longer alleles
-show stronger expansion bias and larger individual steps.
-
-Model: length-dependent Markov chain
-  At each mutation event from current length L:
-    α(L)  = sigmoid(a₀ + a₁·L)    — expansion probability
-    p₊(L) = sigmoid(b₀ + b₁·L)    — expansion step-size param (↓ with L → bigger steps)
-    p₋(L) = sigmoid(c₀ + c₁·L)    — contraction step-size param
-    L → L + Geom(p₊(L))   with prob α(L)
-    L → L − Geom(p₋(L))   with prob 1−α(L)
-
-Parameters:
-  Global (Pass 1, MDN): a₀,a₁,b₀,b₁,c₀,c₁ — sigmoid parameters
-  Per-locus Pass 2:     r, q_N — NegBin count distribution
-                        (inferred via 2D grid using PMF from forward simulation)
-
-Inference: Mixture Density Network (MDN) trained on simulated data.
-  Pass 1 trains on: (summary_stats, L₀) → posterior over (a₀,a₁,b₀,b₁,c₀,c₁)
-  Pass 2: fix global params, compute PMF by forward simulation, use 2D grid.
-
-─────────────────────────────────────────────────────────────────────────────
-SLURM usage
-─────────────────────────────────────────────────────────────────────────────
-  # Pass 1 — estimate global params (run once on reference/high-depth loci)
-  python nb_geom_instability.py pass1 \\
-      --input  reference_loci.tsv \\
-      --output global_params.json \\
-      --regime 1           # or 2 for FMR1-type loci
-
-  # Pass 2 — per-locus inference (SLURM array)
-  sbatch --array=1-80 run_pass2.sh
-  # In run_pass2.sh:
-  python nb_geom_instability.py pass2 \\
-      --input         chunk_${SLURM_ARRAY_TASK_ID}.tsv \\
-      --global-params global_params.json \\
-      --output        results_${SLURM_ARRAY_TASK_ID}.tsv \\
-      --regime        1
-
-  Input TSV: locus_id  haplotype  allele_length  founder_length  n_steps
-  Output TSV: one row per (locus_id, haplotype) with all posterior summaries.
-
-  Merge: head -1 results_1.tsv > all.tsv && tail -n+2 -q results_*.tsv >> all.tsv
-
 Python API
 ──────────
   from nb_geom_instability import (
       fit_locus, compare_models,
-      Regime1GlobalParams, Regime2GlobalParams,
-      estimate_regime1_global, train_regime2_mdn,
+      Regime1GlobalParams, stimate_regime1_global,
   )
 
   # Fit both regimes and compare
-  r1, r2 = compare_models(lengths, founder_length=80, n_steps=5,
-                           regime1_params=gp1, regime2_params=gp2)
-  print(r1); print(r2)
+  r1 = compare_models(lengths, founder_length=80, n_steps=5, regime1_params=gp1)
+  print(r1)
 
 Dependencies: numpy, scipy, torch (for Regime 2 MDN)
               pymc (LONG_READ_WGS_LARGE only, not implemented in this version)
@@ -101,16 +51,11 @@ Dependencies: numpy, scipy, torch (for Regime 2 MDN)
 
 from __future__ import annotations
 
-import argparse
-import csv
 import json
-import sys
 import time
 import warnings
 import logging
 from dataclasses import dataclass, asdict, field
-from enum import Enum
-from pathlib import Path
 from typing import Optional
 
 import math
@@ -118,8 +63,6 @@ import numpy as np
 from scipy import stats
 from scipy.stats import skew as _skew, kurtosis as _kurt
 
-# Torch for Regime 2 MDN — imported lazily in Regime 2 functions
-# so the module is usable without torch when only Regime 1 is needed
 
 logging.getLogger("pymc").setLevel(logging.ERROR)
 
@@ -140,23 +83,6 @@ DEFAULT_PP_N     = 7     # number of p₊ grid points around global estimate
 DEFAULT_PM_N     = 7     # number of p₋ grid points around global estimate
 DEFAULT_P_LOG_SD = 0.2   # prior SD in log-odds space for p₊ and p₋ grids
 
-# Regime 2 MDN training defaults
-DEFAULT_N_TRAIN_SIMULATIONS = 20_000   # training simulations for MDN
-DEFAULT_MDN_HIDDEN          = 128      # hidden layer size
-DEFAULT_MDN_COMPONENTS      = 8        # number of mixture components
-DEFAULT_MDN_EPOCHS          = 100
-
-# Regime 2 prior bounds on sigmoid parameters
-# Chosen to span biologically plausible ranges for FMR1-type loci
-REGIME2_PRIOR_BOUNDS = np.array([
-    [-4.0,  0.5],    # a₀: intercept for expansion probability sigmoid
-    [ 0.0,  0.10],   # a₁: slope (expansion prob increases with length)
-    [-0.5,  2.0],    # b₀: intercept for expansion step-size sigmoid
-    [-0.03, 0.01],   # b₁: slope (step size grows with length → p₊ decreases)
-    [-0.5,  2.0],    # c₀: intercept for contraction step-size sigmoid
-    [-0.02, 0.01],   # c₁: slope for contraction step-size
-], dtype=np.float32)
-
 
 # ===========================================================================
 # Global parameter dataclasses
@@ -172,12 +98,12 @@ class Regime1GlobalParams:
     not sample-level parameters, so they are shared across samples.
 
     p₊(L₀): geometric parameter for expansion steps.
-             Smaller p₊ → larger mean expansion step (mean = 1/p₊).
-             Can vary with L₀ via log-odds linear model:
-             logit(p₊(L₀)) = lp0 + lp1·L₀
+            Smaller p₊ → larger mean expansion step (mean = 1/p₊).
+            Can vary with L₀ via log-odds linear model:
+            logit(p₊(L₀)) = lp0 + lp1·L₀
 
     p₋(L₀): geometric parameter for contraction steps.
-             Similarly parameterised.
+            Similarly parameterised.
 
     q_e, q_c: NegBin probability for the expansion and contraction
               count distributions. Estimated from the shape of the
@@ -328,7 +254,7 @@ class Regime1GlobalParams:
         -----
         # Run once on your initial results, then rerun analysis with new params
         gp_initial = Regime1GlobalParams.from_defaults(repeat_unit_length=3)
-        results = analyse_genome_wide(catalog, gp_initial, ...)
+        results    = analyse_genome_wide(catalog, gp_initial, ...)
         write_tsv(results, 'initial_results.tsv')
 
         gp_calibrated = Regime1GlobalParams.calibrate_from_results(
@@ -417,78 +343,6 @@ class Regime1GlobalParams:
             f"  p₊(L0) = sigmoid({self.lp0:.4f} + {self.lp1:.5f}·L0)\n"
             f"  p₋(L0) = sigmoid({self.lm0:.4f} + {self.lm1:.5f}·L0)\n"
             f"  q_e={self.q_e:.3f}, q_c={self.q_c:.3f}\n"
-            f"  n_loci={self.n_loci_used}\n)"
-        )
-
-
-@dataclass
-class Regime2GlobalParams:
-    """
-    Global parameters for Regime 2 (length-dependent Markov chain).
-
-    Six sigmoid parameters controlling how expansion probability and
-    step-size distributions change with current repeat length L:
-        α(L)  = sigmoid(a₀ + a₁·L)   — expansion probability
-        p₊(L) = sigmoid(b₀ + b₁·L)   — expansion step-size param
-        p₋(L) = sigmoid(c₀ + c₁·L)   — contraction step-size param
-
-    Estimated by training a Mixture Density Network (MDN) on simulated
-    data and applying it to observed summary statistics from high-depth
-    reference loci spanning a range of founder lengths.
-
-    The MDN provides a full posterior over these parameters, not just
-    point estimates — the posterior_samples field stores 2000 draws from
-    the MDN posterior for uncertainty propagation into per-locus inference.
-    """
-    # Point estimates (posterior means)
-    a0: float = -2.0    # α(L) intercept
-    a1: float =  0.05   # α(L) slope
-    b0: float =  0.8    # p₊(L) intercept
-    b1: float = -0.01   # p₊(L) slope
-    c0: float =  0.8    # p₋(L) intercept
-    c1: float = -0.005  # p₋(L) slope
-
-    # NegBin count distribution params (estimated separately)
-    q_N: float = 0.5
-
-    # MDN metadata for reproducibility
-    n_training_simulations: int   = 0
-    n_loci_used:            int   = 0
-    mdn_state_dict_path:    str   = ""   # path to saved MDN weights
-
-    # Posterior samples for uncertainty propagation (not serialised to JSON)
-    posterior_samples: Optional[np.ndarray] = field(default=None, repr=False)
-
-    def alpha(self, L: float) -> float:
-        """Expansion probability at current length L."""
-        return float(_sigmoid_scalar(self.a0 + self.a1 * L))
-
-    def p_plus(self, L: float) -> float:
-        """Expansion step-size geometric parameter at current length L."""
-        return float(_sigmoid_scalar(self.b0 + self.b1 * L))
-
-    def p_minus(self, L: float) -> float:
-        """Contraction step-size geometric parameter at current length L."""
-        return float(_sigmoid_scalar(self.c0 + self.c1 * L))
-
-    def to_json(self) -> str:
-        d = asdict(self)
-        d.pop("posterior_samples", None)   # not serialisable
-        return json.dumps(d, indent=2)
-
-    @classmethod
-    def from_json(cls, s: str) -> "Regime2GlobalParams":
-        d = json.loads(s)
-        d.pop("posterior_samples", None)
-        return cls(**d)
-
-    def __repr__(self) -> str:
-        return (
-            f"Regime2GlobalParams(\n"
-            f"  α(L)  = sigmoid({self.a0:.4f} + {self.a1:.5f}·L)\n"
-            f"  p₊(L) = sigmoid({self.b0:.4f} + {self.b1:.5f}·L)\n"
-            f"  p₋(L) = sigmoid({self.c0:.4f} + {self.c1:.5f}·L)\n"
-            f"  q_N={self.q_N:.3f}\n"
             f"  n_loci={self.n_loci_used}\n)"
         )
 
@@ -607,70 +461,6 @@ class Regime1Result:
         return d
 
 
-@dataclass
-class Regime2Result:
-    """
-    Posterior summary for Regime 2 (length-dependent Markov chain) inference.
-    """
-    haplotype_label: str
-    n_reads:         int
-    founder_length:  float
-    n_steps_prior:   float   # prior mean for N_steps
-
-    # Global sigmoid params used
-    a0: float; a1: float
-    b0: float; b1: float
-    c0: float; c1: float
-
-    # Per-locus posteriors
-    r:                 tuple[float, float, float]   # NegBin dispersion for N_steps
-    q_N:               tuple[float, float, float]   # NegBin probability for N_steps
-    mu_N:              tuple[float, float, float]   # mean N_steps per read
-    instability_index: tuple[float, float, float]   # Var(Δ) from simulation
-    net_bias:          tuple[float, float, float]   # Mean(Δ) from simulation
-    p_expansion:       tuple[float, float, float]   # P(net_bias > 0)
-
-    # Length-dependent quantities at L₀
-    alpha_at_L0:  float   # expansion probability at founder length
-    p_plus_at_L0: float   # expansion step-size param at founder length
-    p_minus_at_L0: float  # contraction step-size param at founder length
-
-    elapsed_s: float
-
-    def __repr__(self) -> str:
-        def f(n, v): return f"  {n:<24s}= {v[0]:.4f}  95%CI [{v[1]:.4f}, {v[2]:.4f}]"
-        lines = [
-            f"Regime2Result(haplotype='{self.haplotype_label}', n={self.n_reads}, L0={self.founder_length:.1f})",
-            f"  α(L₀)={self.alpha_at_L0:.3f}  p₊(L₀)={self.p_plus_at_L0:.3f}  p₋(L₀)={self.p_minus_at_L0:.3f}",
-            "",
-            "  --- NegBin step count parameters ---",
-            f("r (dispersion)",       self.r),
-            f("q_N",                  self.q_N),
-            f("μ_N (mean steps)",     self.mu_N),
-            "",
-            "  --- Instability indices (from simulation) ---",
-            f("instability_index",    self.instability_index),
-            f("net_bias",             self.net_bias),
-            f("p_expansion",          self.p_expansion),
-            f"\n  elapsed = {self.elapsed_s*1000:.1f} ms",
-        ]
-        return "\n".join(lines)
-
-    def to_dict(self) -> dict:
-        d = {"regime": "2", "haplotype": self.haplotype_label,
-             "n_reads": self.n_reads, "founder_length": self.founder_length,
-             "alpha_at_L0": self.alpha_at_L0,
-             "p_plus_at_L0": self.p_plus_at_L0,
-             "p_minus_at_L0": self.p_minus_at_L0}
-        for field_name in ["r","q_N","mu_N","instability_index","net_bias","p_expansion"]:
-            v = getattr(self, field_name)
-            d[field_name]          = v[0]
-            d[field_name+"_ci_lo"] = v[1]
-            d[field_name+"_ci_hi"] = v[2]
-        d["elapsed_s"] = self.elapsed_s
-        return d
-
-
 # ===========================================================================
 # Shared utilities
 # ===========================================================================
@@ -703,25 +493,12 @@ def _summary_stats(deltas: np.ndarray, L0: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def _modal_length(lengths_int: np.ndarray) -> float:
-    vals, cts = np.unique(lengths_int, return_counts=True)
-    return float(vals[np.argmax(cts)])
-
-
 # ===========================================================================
 # REGIME 1 — NB-Geometric compound via FFT
 # ===========================================================================
 
-def _nb_geom_grid_loglik_r1(
-    deltas: np.ndarray,
-    re_grid: np.ndarray,
-    rc_grid: np.ndarray,
-    pp: float,
-    pm: float,
-    qe: float,
-    qc: float,
-    N: Optional[int] = None,
-) -> np.ndarray:
+def _nb_geom_grid_loglik_r1(deltas: np.ndarray, re_grid: np.ndarray, rc_grid: np.ndarray,
+                            pp: float, pm: float, qe: float, qc: float, N: Optional[int] = None) -> np.ndarray:
     """
     Vectorised log-likelihood for the NB-Geometric compound (Regime 1)
     over a 2D grid of (r_e, r_c) with p₊, p₋, q_e, q_c fixed.
@@ -994,343 +771,6 @@ def estimate_regime1_global(
 
 
 # ===========================================================================
-# REGIME 2 — Length-dependent Markov chain + MDN
-# ===========================================================================
-
-def _simulate_markov_chain(
-    L0: float,
-    N_steps: int,
-    a0: float, a1: float,
-    b0: float, b1: float,
-    c0: float, c1: float,
-    rng: np.random.Generator,
-    n_reads: int,
-) -> np.ndarray:
-    """
-    Simulate n_reads endpoint deltas from the length-dependent Markov chain.
-
-    For each read, draw N_steps mutation events starting from L₀.
-    At each step from current length L:
-        - With prob α(L) = sigmoid(a₀+a₁L): expand by Geom(p₊(L))
-        - With prob 1−α(L):                 contract by Geom(p₋(L))
-    Record endpoint delta = L_final − L₀.
-
-    The Geometric distribution here uses support {1, 2, 3, ...} (at least
-    one repeat unit changes per event, never zero), which is correct for
-    replication slippage where the fork must re-anneal at a displaced position.
-    """
-    deltas = np.zeros(n_reads, dtype=int)
-    for i in range(n_reads):
-        L = float(L0)
-        for _ in range(N_steps):
-            alpha  = _sigmoid_scalar(a0 + a1 * L)
-            if rng.random() < alpha:
-                # Expansion: step size ~ Geometric(p₊(L)), support {1,2,...}
-                p_plus_L = max(_sigmoid_scalar(b0 + b1 * L), 0.01)
-                L += int(rng.geometric(p_plus_L))
-            else:
-                # Contraction: step size ~ Geometric(p₋(L)), floor at 1
-                p_minus_L = max(_sigmoid_scalar(c0 + c1 * L), 0.01)
-                L = max(L - int(rng.geometric(p_minus_L)), 1.0)
-        deltas[i] = int(L - L0)
-    return deltas
-
-
-def train_regime2_mdn(
-    L0_values: list[float],
-    n_steps_range: tuple[int, int] = (2, 8),
-    n_reads: int = 70,
-    n_train: int = DEFAULT_N_TRAIN_SIMULATIONS,
-    hidden: int = DEFAULT_MDN_HIDDEN,
-    n_components: int = DEFAULT_MDN_COMPONENTS,
-    epochs: int = DEFAULT_MDN_EPOCHS,
-    seed: int = 0,
-    save_path: Optional[str] = None,
-) -> tuple:
-    """
-    Train a Mixture Density Network (MDN) for amortised Regime 2 posterior
-    inference over the six sigmoid global parameters.
-
-    The MDN learns:
-        P(a₀,a₁,b₀,b₁,c₀,c₁ | summary_stats, L₀)
-
-    by training on (params, summary_stats) pairs generated by forward
-    simulation of the Markov chain across the range of L₀ values and
-    N_steps values relevant to your loci.
-
-    Parameters
-    ----------
-    L0_values : list of float
-        Founder lengths present in your Regime 2 dataset (e.g. [55,80,100,150,200]
-        for FMR1 premutation range). The MDN is conditioned on L₀, so it
-        covers all these values after one training run.
-    n_steps_range : (min, max)
-        Range of N_steps (number of mutation events per read) to simulate during
-        training. Use a range that brackets the expected somatic mutation burden
-        for your loci. For FMR1 with 70x depth, (2,8) is a reasonable range.
-    n_reads : int
-        Number of reads per simulated locus (match your actual sequencing depth).
-    n_train : int
-        Number of training simulations (default 20,000). More simulations →
-        better posterior approximation but longer training time.
-    hidden : int
-        Hidden layer size for the MDN (default 128).
-    n_components : int
-        Number of Gaussian mixture components (default 8).
-    epochs : int
-        Training epochs (default 100).
-    seed : int
-        RNG seed for reproducibility.
-    save_path : str, optional
-        If provided, save the trained MDN state dict to this path for reuse.
-
-    Returns
-    -------
-    (mdn, X_mean, X_std) : trained MDN module and normalisation stats.
-        Store these (or save_path) for use in Pass 2 inference.
-    """
-    import torch
-    import torch.nn as nn
-
-    rng = np.random.default_rng(seed)
-    torch.manual_seed(seed)
-
-    # --- Generate training data ---
-    X_raw  = np.zeros((n_train, 5), dtype=np.float32)   # summary stats
-    T_norm = np.zeros((n_train, 6), dtype=np.float32)   # normalised params
-
-    lo = REGIME2_PRIOR_BOUNDS[:, 0]
-    hi = REGIME2_PRIOR_BOUNDS[:, 1]
-
-    for i in range(n_train):
-        # Sample parameters from the prior
-        theta = np.array([rng.uniform(lo[j], hi[j]) for j in range(6)])
-        a0,a1,b0,b1,c0,c1 = theta
-
-        # Sample a random L₀ and N_steps for this training simulation
-        L0      = float(rng.choice(L0_values))
-        N_steps = int(rng.integers(n_steps_range[0], n_steps_range[1] + 1))
-
-        # Simulate the Markov chain and compute summary statistics
-        d = _simulate_markov_chain(L0, N_steps, a0,a1,b0,b1,c0,c1, rng, n_reads)
-        X_raw[i]  = _summary_stats(d, L0)
-
-        # Normalise theta to [-1, 1] for stable MDN training
-        T_norm[i] = (theta - lo) / (hi - lo) * 2 - 1
-
-    # Standardise summary statistics (zero mean, unit variance)
-    X_mean = X_raw.mean(0).astype(np.float32)
-    X_std  = (X_raw.std(0) + 1e-6).astype(np.float32)
-    X_norm = (X_raw - X_mean) / X_std
-
-    # --- Define and train MDN ---
-    class _MDN(nn.Module):
-        """
-        Mixture Density Network mapping summary stats to posterior over params.
-        Architecture: 3-layer MLP → mixture of K Gaussians over 6D param space.
-        Output: K mixture weights, K×6 means, K×6 log-standard-deviations.
-        """
-        def __init__(self, x_dim=5, t_dim=6, hid=128, K=8):
-            super().__init__()
-            self.K = K; self.t_dim = t_dim
-            self.net = nn.Sequential(
-                nn.Linear(x_dim, hid), nn.Tanh(),
-                nn.Linear(hid, hid),   nn.Tanh(),
-                nn.Linear(hid, hid),   nn.Tanh(),
-                nn.Linear(hid, K * (1 + t_dim + t_dim)),
-            )
-
-        def forward(self, x):
-            o = self.net(x); n = x.shape[0]; K = self.K; d = self.t_dim
-            logw = o[:, :K]
-            mu   = o[:, K:K+K*d].reshape(n, K, d)
-            logs = o[:, K+K*d:].reshape(n, K, d)
-            return logw, mu, logs
-
-        def nll(self, x, theta):
-            """Negative log-likelihood: −E[log P(theta | x)] under MDN."""
-            logw, mu, logs = self(x)
-            w   = torch.softmax(logw, dim=1)
-            sig = logs.exp().clamp(1e-3, 5.0)
-            # log P(theta | component k) = sum of independent Normal log-probs
-            lpk = (-0.5 * ((theta[:, None, :] - mu) / sig) ** 2
-                   - logs - 0.5 * np.log(2 * np.pi)).sum(dim=2)
-            return -torch.logsumexp(torch.log(w + 1e-10) + lpk, dim=1).mean()
-
-        def sample_posterior(self, x: np.ndarray, n_samples: int = 2000) -> np.ndarray:
-            """
-            Draw n_samples from the MDN posterior given observed summary stats x.
-            Returns normalised samples in [-1,1]^6 — caller denormalises.
-            """
-            xt = torch.tensor(x[None], dtype=torch.float32)
-            with torch.no_grad():
-                logw, mu, logs = self(xt)
-                w   = torch.softmax(logw, dim=1)
-                sig = logs.exp().clamp(1e-3, 5.0)
-                # Sample component index proportional to mixture weights
-                k = torch.multinomial(w[0], n_samples, replacement=True)
-                # Sample from the selected Gaussian components
-                samples = (mu[0, k] + sig[0, k] * torch.randn(n_samples, self.t_dim))
-            return samples.numpy()
-
-    mdn = _MDN(x_dim=5, t_dim=6, hid=hidden, K=n_components)
-    opt = torch.optim.Adam(mdn.parameters(), lr=1e-3)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-
-    Xt = torch.tensor(X_norm)
-    Tt = torch.tensor(T_norm)
-    ds = torch.utils.data.TensorDataset(Xt, Tt)
-    dl = torch.utils.data.DataLoader(ds, batch_size=256, shuffle=True)
-
-    mdn.train()
-    for epoch in range(epochs):
-        for xb, tb in dl:
-            opt.zero_grad()
-            loss = mdn.nll(xb, tb)
-            loss.backward()
-            opt.step()
-        sched.step()
-
-    mdn.eval()
-
-    if save_path:
-        torch.save({
-            "state_dict": mdn.state_dict(),
-            "X_mean": X_mean, "X_std": X_std,
-            "prior_bounds": REGIME2_PRIOR_BOUNDS,
-            "n_components": n_components,
-            "hidden": hidden,
-        }, save_path)
-
-    return mdn, X_mean, X_std
-
-
-def _regime2_infer_global(
-    mdn,
-    X_mean: np.ndarray,
-    X_std: np.ndarray,
-    loci_data: list[dict],
-    n_samples: int = 2000,
-) -> Regime2GlobalParams:
-    """
-    Apply the trained MDN to observed summary statistics from reference loci
-    to obtain the posterior over global sigmoid parameters.
-
-    Pools posteriors across loci by averaging the log-posterior across loci
-    (equivalent to a product of likelihoods under the shared parameter model).
-    """
-    lo = REGIME2_PRIOR_BOUNDS[:, 0]
-    hi = REGIME2_PRIOR_BOUNDS[:, 1]
-
-    all_samples = []
-    for locus in loci_data:
-        deltas = np.asarray(locus["deltas"], dtype=float)
-        L0     = float(locus["founder_length"])
-        ss     = _summary_stats(deltas, L0)
-        ss_n   = (ss - X_mean) / X_std   # normalise same as training
-
-        # Sample posterior from MDN for this locus
-        samples_n = mdn.sample_posterior(ss_n, n_samples=n_samples)
-        # Denormalise from [-1,1] back to parameter space
-        samples   = (samples_n + 1) / 2 * (hi - lo) + lo
-        all_samples.append(samples)
-
-    # Pool: stack all locus posteriors and take the mean (approximate product)
-    pooled = np.concatenate(all_samples, axis=0)
-    means  = pooled.mean(0)
-    a0,a1,b0,b1,c0,c1 = means
-
-    return Regime2GlobalParams(
-        a0=float(a0), a1=float(a1),
-        b0=float(b0), b1=float(b1),
-        c0=float(c0), c1=float(c1),
-        n_loci_used=len(loci_data),
-        posterior_samples=pooled,
-    )
-
-
-def _regime2_simulate_endpoint_pmf(
-    L0: float,
-    r: float,
-    q_N: float,
-    gp: Regime2GlobalParams,
-    rng: np.random.Generator,
-    n_sim: int = 3000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Approximate the endpoint PMF P(Δ | r, q_N, L₀, global_params) by
-    forward simulation of the Markov chain.
-
-    For each simulated read:
-      1. Draw N ~ NegBin(r, q_N) (number of mutation events)
-      2. Run the Markov chain N steps from L₀
-      3. Record Δ = L_final − L₀
-
-    Returns (delta_values, probabilities) — the empirical PMF.
-    """
-    a0,a1,b0,b1,c0,c1 = gp.a0,gp.a1,gp.b0,gp.b1,gp.c0,gp.c1
-    N_sim_arr = rng.negative_binomial(r, q_N, n_sim)
-    deltas_sim = np.zeros(n_sim, dtype=int)
-
-    for i, N_steps in enumerate(N_sim_arr):
-        if N_steps == 0:
-            deltas_sim[i] = 0
-            continue
-        L = float(L0)
-        for _ in range(int(N_steps)):
-            alpha   = _sigmoid_scalar(a0 + a1 * L)
-            if rng.random() < alpha:
-                pp = max(_sigmoid_scalar(b0 + b1 * L), 0.01)
-                L += int(rng.geometric(pp))
-            else:
-                pm = max(_sigmoid_scalar(c0 + c1 * L), 0.01)
-                L = max(L - int(rng.geometric(pm)), 1.0)
-        deltas_sim[i] = int(L - L0)
-
-    # Build empirical PMF from simulation
-    vals, cnts = np.unique(deltas_sim, return_counts=True)
-    probs = cnts.astype(float) / cnts.sum()
-    return vals, probs
-
-
-def _regime2_grid_loglik(
-    deltas: np.ndarray,
-    r_grid: np.ndarray,
-    qn_grid: np.ndarray,
-    gp: Regime2GlobalParams,
-    rng: np.random.Generator,
-    n_sim: int = 2000,
-) -> np.ndarray:
-    """
-    2D grid log-likelihood for Regime 2 over (r, q_N) grid.
-
-    For each (r, q_N) grid point, the PMF is approximated by forward
-    simulation. The simulation is expensive but the 2D grid is small
-    (typically 15×15 = 225 points) so total cost is manageable.
-
-    Returns loglik of shape (n_r, n_qn).
-    """
-    deltas   = np.asarray(deltas, dtype=int)
-    L0       = float(gp.a0)   # L₀ encoded separately; passed via gp for simplicity
-    # Note: L0 should be passed separately in the real pipeline — see fit_locus_r2
-
-    unique_d, counts = np.unique(deltas, return_counts=True)
-    loglik = np.full((len(r_grid), len(qn_grid)), -np.inf)
-
-    for ir, r in enumerate(r_grid):
-        for iq, qn in enumerate(qn_grid):
-            vals, probs = _regime2_simulate_endpoint_pmf(
-                float(gp.a0), r, qn, gp, rng, n_sim=n_sim
-            )
-            pmf_dict = dict(zip(vals.tolist(), np.log(probs + 1e-300).tolist()))
-            ll = sum(pmf_dict.get(int(d), -700.0) * c
-                     for d, c in zip(unique_d, counts))
-            loglik[ir, iq] = ll
-
-    return loglik
-
-
-# ===========================================================================
 # Public API
 # ===========================================================================
 
@@ -1438,413 +878,6 @@ def fit_locus_r1(
         mitotic_generations      = mitotic_generations,
         elapsed_s                = time.time() - t0,
     )
-
-
-def fit_locus_r2(
-    lengths,
-    founder_length: float,
-    global_params: Regime2GlobalParams,
-    haplotype_label: str = "haplotype",
-    r_grid:  Optional[np.ndarray] = None,
-    qn_grid: Optional[np.ndarray] = None,
-    n_sim_per_point: int = 2000,
-    seed: int = 0,
-) -> Regime2Result:
-    """
-    Fit Regime 2 (length-dependent Markov chain) for one phased haplotype.
-
-    Parameters
-    ----------
-    lengths : array-like
-        Per-read allele lengths for this haplotype.
-    founder_length : float
-        Germline allele length L₀.
-    global_params : Regime2GlobalParams
-        Sigmoid parameters a₀,a₁,b₀,b₁,c₀,c₁ from Pass 1 MDN inference.
-    n_sim_per_point : int
-        Simulations per grid point for PMF approximation (default 2000).
-        Higher → more accurate but slower.
-    """
-    t0  = time.time()
-    rng = np.random.default_rng(seed)
-
-    lengths     = np.asarray(lengths)
-    lengths_int = np.round(lengths).astype(int)
-    mode_int    = int(round(founder_length))
-    deltas      = (lengths_int - mode_int).astype(int)
-
-    r_grid  = r_grid  if r_grid  is not None else np.linspace(0.1, 8.0, 15)
-    qn_grid = qn_grid if qn_grid is not None else np.linspace(0.1, 0.9, 15)
-
-    gp = global_params
-
-    # Compute loglik over (r, q_N) grid using forward simulation
-    unique_d, counts = np.unique(deltas, return_counts=True)
-    loglik = np.full((len(r_grid), len(qn_grid)), -np.inf)
-
-    for ir, r in enumerate(r_grid):
-        for iq, qn in enumerate(qn_grid):
-            # Simulate endpoint distribution for this (r, q_N)
-            N_sim_arr = rng.negative_binomial(r, qn, n_sim_per_point)
-            dsim = np.zeros(n_sim_per_point, dtype=int)
-            for i, N_steps in enumerate(N_sim_arr):
-                if N_steps == 0:
-                    dsim[i] = 0; continue
-                L = float(founder_length)
-                for _ in range(int(N_steps)):
-                    al = _sigmoid_scalar(gp.a0 + gp.a1 * L)
-                    if rng.random() < al:
-                        pp = max(_sigmoid_scalar(gp.b0 + gp.b1 * L), 0.01)
-                        L += int(rng.geometric(pp))
-                    else:
-                        pm = max(_sigmoid_scalar(gp.c0 + gp.c1 * L), 0.01)
-                        L = max(L - int(rng.geometric(pm)), 1.0)
-                dsim[i] = int(L - founder_length)
-
-            vals, cnts = np.unique(dsim, return_counts=True)
-            pmf_dict = dict(zip(vals.tolist(), (cnts/cnts.sum()).tolist()))
-            ll = sum(np.log(max(pmf_dict.get(int(d), 1e-300), 1e-300)) * c
-                     for d, c in zip(unique_d, counts))
-            loglik[ir, iq] = ll
-
-    # Posterior
-    log_prior = (stats.gamma.logpdf(r_grid,  a=1.5, scale=1.0)[:, None]
-               + stats.beta.logpdf(qn_grid, a=1.5, b=1.5)[None, :])
-    lp = loglik + log_prior; lp -= lp.max()
-    post = np.exp(lp); post /= post.sum()
-
-    R, QN = np.meshgrid(r_grid, qn_grid, indexing="ij")
-    mu_N  = R * (1 - QN) / QN
-
-    # Estimate instability index and net bias from simulation at posterior mean params
-    r_mean  = float((post * R).sum())
-    qn_mean = float((post * QN).sum())
-    mun_mean = float((post * mu_N).sum())
-
-    dsim_post = np.zeros(5000, dtype=int)
-    N_post = rng.negative_binomial(r_mean, qn_mean, 5000)
-    for i, N_steps in enumerate(N_post):
-        if N_steps == 0: continue
-        L = float(founder_length)
-        for _ in range(int(N_steps)):
-            al = _sigmoid_scalar(gp.a0 + gp.a1*L)
-            if rng.random() < al:
-                pp = max(_sigmoid_scalar(gp.b0 + gp.b1*L), 0.01)
-                L += int(rng.geometric(pp))
-            else:
-                pm = max(_sigmoid_scalar(gp.c0 + gp.c1*L), 0.01)
-                L = max(L - int(rng.geometric(pm)), 1.0)
-        dsim_post[i] = int(L - founder_length)
-
-    inst_est = float(dsim_post.var())
-    bias_est = float(dsim_post.mean())
-
-    def ci(arr):
-        m=float((post*arr).sum()); af=arr.ravel(); pf=post.ravel()
-        si=np.argsort(af); cdf=np.cumsum(pf[si])
-        return m, float(af[si[np.searchsorted(cdf,0.025)]]), float(af[si[np.searchsorted(cdf,0.975)]])
-
-    return Regime2Result(
-        haplotype_label   = haplotype_label,
-        n_reads           = len(lengths_int),
-        founder_length    = founder_length,
-        n_steps_prior     = float(r_mean * (1-qn_mean)/qn_mean),
-        a0=gp.a0, a1=gp.a1, b0=gp.b0, b1=gp.b1, c0=gp.c0, c1=gp.c1,
-        r                 = ci(R),
-        q_N               = ci(QN),
-        mu_N              = ci(mu_N),
-        instability_index = (inst_est, inst_est*0.5, inst_est*2.0),  # wide CI from simulation
-        net_bias          = (bias_est, bias_est-2*dsim_post.std(), bias_est+2*dsim_post.std()),
-        p_expansion       = (float((dsim_post > 0).mean()), 0.0, 1.0),
-        alpha_at_L0       = gp.alpha(founder_length),
-        p_plus_at_L0      = gp.p_plus(founder_length),
-        p_minus_at_L0     = gp.p_minus(founder_length),
-        elapsed_s         = time.time() - t0,
-    )
-
-
-def compare_models(
-    lengths,
-    founder_length: float,
-    regime1_params: Regime1GlobalParams,
-    regime2_params: Regime2GlobalParams,
-    haplotype_label: str = "haplotype",
-    seed: int = 0,
-) -> tuple[Regime1Result, Regime2Result]:
-    """
-    Fit both Regime 1 and Regime 2 on the same reads and return both results
-    for side-by-side comparison.
-
-    Use this to:
-    - Validate Regime 2 against the analytically tractable Regime 1 on loci
-      where both should agree (small somatic excursions)
-    - Assess how much the length-dependence in Regime 2 changes the
-      instability index for large-expansion loci
-
-    Parameters
-    ----------
-    lengths : array-like
-        Per-read allele lengths (already phased to one haplotype).
-    founder_length : float
-        Germline allele length L₀.
-    regime1_params : Regime1GlobalParams
-        Pass 1 output for Regime 1.
-    regime2_params : Regime2GlobalParams
-        Pass 1 output for Regime 2 (from MDN inference).
-
-    Returns
-    -------
-    (regime1_result, regime2_result)
-    """
-    r1 = fit_locus_r1(lengths, founder_length, regime1_params,
-                       haplotype_label=haplotype_label, seed=seed)
-    r2 = fit_locus_r2(lengths, founder_length, regime2_params,
-                       haplotype_label=haplotype_label, seed=seed+1000)
-    return r1, r2
-
-
-# ===========================================================================
-# SLURM batch processing
-# ===========================================================================
-
-def process_chunk(
-    input_path: str,
-    output_path: str,
-    regime: int,
-    regime1_params: Optional[Regime1GlobalParams] = None,
-    regime2_params: Optional[Regime2GlobalParams] = None,
-    seed: int = 0,
-) -> None:
-    """
-    Process one TSV chunk for SLURM Pass 2.
-    Input TSV: locus_id, haplotype, allele_length, founder_length
-    Output TSV: one row per (locus_id, haplotype) with posterior summaries.
-    """
-    data:     dict[tuple, list]  = {}
-    founders: dict[tuple, float] = {}
-
-    with open(input_path) as f:
-        for row in csv.DictReader(f, delimiter="\t"):
-            key = (row["locus_id"], row["haplotype"])
-            data.setdefault(key, []).append(float(row["allele_length"]))
-            if "founder_length" in row and row["founder_length"]:
-                founders[key] = float(row["founder_length"])
-
-    results = []
-    for (locus_id, haplotype), lengths in data.items():
-        fl = founders.get((locus_id, haplotype))
-        if fl is None:
-            arr = np.round(np.asarray(lengths)).astype(int)
-            vals, cts = np.unique(arr, return_counts=True)
-            fl = float(vals[np.argmax(cts)])
-        try:
-            if regime == 1:
-                r = fit_locus_r1(lengths, fl, regime1_params,
-                                  haplotype_label=haplotype, seed=seed)
-            else:
-                r = fit_locus_r2(lengths, fl, regime2_params,
-                                  haplotype_label=haplotype, seed=seed)
-            row_out = {"locus_id": locus_id}
-            row_out.update(r.to_dict())
-            results.append(row_out)
-        except Exception as e:
-            results.append({"locus_id": locus_id, "haplotype": haplotype,
-                            "error": str(e)})
-
-    if not results:
-        return
-    fieldnames = list(results[0].keys())
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t",
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(results)
-
-
-# ===========================================================================
-# CLI
-# ===========================================================================
-
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="NB-Geometric somatic instability (pass1 | pass2)"
-    )
-    sub = p.add_subparsers(dest="command")
-
-    p1 = sub.add_parser("pass1", help="Estimate global params")
-    p1.add_argument("--input",  required=True)
-    p1.add_argument("--output", required=True, help="JSON output path")
-    p1.add_argument("--regime", type=int, default=1, choices=[1, 2])
-    p1.add_argument("--min-reads", type=int, default=10)
-    p1.add_argument("--n-train", type=int, default=DEFAULT_N_TRAIN_SIMULATIONS,
-                    help="Training simulations for Regime 2 MDN")
-    p1.add_argument("--mdn-save", default=None, help="Path to save MDN weights")
-    p1.add_argument("--seed", type=int, default=0)
-
-    p2 = sub.add_parser("pass2", help="Per-locus inference (SLURM array)")
-    p2.add_argument("--input",         required=True)
-    p2.add_argument("--output",        required=True)
-    p2.add_argument("--global-params", required=True)
-    p2.add_argument("--regime", type=int, default=1, choices=[1, 2])
-    p2.add_argument("--seed",   type=int, default=0)
-    return p.parse_args()
-
-
-# ===========================================================================
-# Self-test
-# ===========================================================================
-
-def _run_selftest():
-    rng = np.random.default_rng(42)
-
-    print("=" * 65)
-    print("REGIME 1 SELF-TEST — NB-Geometric compound (FFT grid)")
-    print("=" * 65)
-
-    # True parameters
-    true_re, true_rc = 2.0, 1.0
-    true_pp, true_pm = 0.4, 0.5
-    true_qe, true_qc = 0.5, 0.5
-    L0 = 40.0
-
-    # Analytical instability index
-    mu_Ne_t = true_re*(1-true_qe)/true_qe; var_Ne_t = true_re*(1-true_qe)/true_qe**2
-    mu_Nc_t = true_rc*(1-true_qc)/true_qc; var_Nc_t = true_rc*(1-true_qc)/true_qc**2
-    true_inst = (mu_Ne_t*(1-true_pp)/true_pp**2 + var_Ne_t/true_pp**2 +
-                 mu_Nc_t*(1-true_pm)/true_pm**2 + var_Nc_t/true_pm**2)
-    true_bias = mu_Ne_t/true_pp - mu_Nc_t/true_pm
-
-    print(f"True: r_e={true_re} r_c={true_rc} p₊={true_pp} p₋={true_pm}")
-    print(f"True instability index: {true_inst:.3f}")
-    print(f"True net bias: {true_bias:.3f}")
-
-    # Simulate reads
-    def sim_r1(re,rc,pp,pm,qe,qc,n,rng):
-        Ne=rng.negative_binomial(re,qe,n); Nc=rng.negative_binomial(rc,qc,n)
-        E=np.array([rng.geometric(pp,k).sum() if k>0 else 0 for k in Ne])
-        C=np.array([rng.geometric(pm,k).sum() if k>0 else 0 for k in Nc])
-        return (E-C).astype(int)
-
-    h1_d = sim_r1(true_re,true_rc,true_pp,true_pm,true_qe,true_qc,25,rng)
-    h1_lengths = (L0 + h1_d).astype(int)
-
-    # Global params (using true values as prior centre)
-    gp1 = Regime1GlobalParams(
-        lp0=float(np.log(true_pp/(1-true_pp))), lp1=0.0,
-        lm0=float(np.log(true_pm/(1-true_pm))), lm1=0.0,
-        q_e=true_qe, q_c=true_qc,
-    )
-
-    r1 = fit_locus_r1(h1_lengths, L0, gp1, haplotype_label="H1")
-    print(f"\nH1 reads: {sorted(h1_lengths.tolist())}")
-    print(r1)
-
-    # Test with mitotic_generations (blood adult: G=60)
-    print(f"\nWith G=60 (adult blood):")
-    r1_with_G = fit_locus_r1(h1_lengths, L0, gp1,
-                              haplotype_label="H1", mitotic_generations=60.0)
-    print(r1_with_G)
-
-    # Test from_defaults and from_stratum
-    print("\n--- from_defaults() and from_stratum() ---")
-    gp_default = Regime1GlobalParams.from_defaults(repeat_unit_length=3)
-    gp_cag     = Regime1GlobalParams.from_stratum("disease_cag")
-    print(f"from_defaults(3bp):     p₊={gp_default.p_plus(40):.3f}  p₋={gp_default.p_minus(40):.3f}")
-    print(f"from_stratum(CAG):      p₊={gp_cag.p_plus(40):.3f}  p₋={gp_cag.p_minus(40):.3f}")
-
-    # CI coverage
-    print("\n--- CI coverage (50 trials, n=25) ---")
-    covered = 0; times = []
-    for _ in range(50):
-        d = sim_r1(true_re,true_rc,true_pp,true_pm,true_qe,true_qc,25,rng)
-        lengths = (L0+d).astype(int)
-        res = fit_locus_r1(lengths, L0, gp1, mitotic_generations=60.0)
-        times.append(res.elapsed_s)
-        if res.instability_index[1] <= true_inst <= res.instability_index[2]:
-            covered += 1
-    print(f"Coverage: {covered}/50 = {covered/50*100:.0f}%")
-    print(f"Mean time: {np.mean(times)*1000:.1f}ms")
-    print(f"4M loci @ 100 cores: {4e6*np.mean(times)/100/3600:.2f} hours")
-
-    print("\n" + "=" * 65)
-    print("REGIME 2 SELF-TEST — Length-dependent Markov chain + MDN")
-    print("=" * 65)
-
-    # True Regime 2 params (FMR1-like: expansion bias grows with length)
-    true_a0, true_a1 = -2.0,  0.04   # α(55) ≈ 0.36, α(150) ≈ 0.71
-    true_b0, true_b1 =  1.0, -0.008  # p₊(55) ≈ 0.69 → mean step ~1.5; p₊(150) ≈ 0.50
-    true_c0, true_c1 =  1.0, -0.003  # p₋ less length-dependent
-
-    L0_values = [55, 80, 100, 120, 150]
-    L0_test   = 100.0
-    N_steps   = 4
-
-    print(f"True params: a₀={true_a0} a₁={true_a1} b₀={true_b0} b₁={true_b1}")
-    print(f"α({L0_test})={_sigmoid_scalar(true_a0+true_a1*L0_test):.3f}  "
-          f"p₊({L0_test})={_sigmoid_scalar(true_b0+true_b1*L0_test):.3f}")
-
-    print("\nTraining MDN (5000 simulations, 60 epochs)...")
-    t0 = time.time()
-    mdn, X_mean, X_std = train_regime2_mdn(
-        L0_values=L0_values,
-        n_steps_range=(2, 7),
-        n_reads=70,
-        n_train=5000,   # reduced for self-test
-        epochs=60,
-        seed=0,
-    )
-    print(f"MDN trained in {time.time()-t0:.1f}s")
-
-    # Generate reference loci for Pass 1 inference
-    ref_loci = []
-    for L0 in L0_values:
-        d = _simulate_markov_chain(L0, N_steps,
-                                   true_a0,true_a1,true_b0,true_b1,true_c0,true_c1,
-                                   rng, n_reads=70)
-        ref_loci.append({"deltas": d, "founder_length": L0})
-
-    gp2 = _regime2_infer_global(mdn, X_mean, X_std, ref_loci, n_samples=1000)
-    print(f"\nInferred: a₀={gp2.a0:.3f} a₁={gp2.a1:.4f} b₀={gp2.b0:.3f} b₁={gp2.b1:.4f}")
-    print(f"True:     a₀={true_a0:.3f} a₁={true_a1:.4f} b₀={true_b0:.3f} b₁={true_b1:.4f}")
-
-    # Per-locus fit
-    print(f"\nFitting one locus (L0={L0_test}, n=70 reads)...")
-    d_obs = _simulate_markov_chain(L0_test, N_steps,
-                                   true_a0,true_a1,true_b0,true_b1,true_c0,true_c1,
-                                   rng, n_reads=70)
-    lengths_obs = (L0_test + d_obs).astype(int)
-    print(f"Reads: {sorted(lengths_obs.tolist()[:15])} ...")
-
-    r2 = fit_locus_r2(lengths_obs, L0_test, gp2, n_sim_per_point=1000, seed=1)
-    print(r2)
-
-    print("\n" + "=" * 65)
-    print("COMPARE MODELS — both regimes on same data")
-    print("=" * 65)
-    r1_comp, r2_comp = compare_models(
-        lengths_obs, L0_test,
-        regime1_params=gp1, regime2_params=gp2,
-    )
-    print("Regime 1:")
-    print(f"  instability = {r1_comp.instability_index[0]:.3f} "
-          f"[{r1_comp.instability_index[1]:.3f}, {r1_comp.instability_index[2]:.3f}]")
-    print(f"  net_bias    = {r1_comp.net_bias[0]:.3f} "
-          f"[{r1_comp.net_bias[1]:.3f}, {r1_comp.net_bias[2]:.3f}]")
-    print("Regime 2:")
-    print(f"  instability = {r2_comp.instability_index[0]:.3f} "
-          f"[{r2_comp.instability_index[1]:.3f}, {r2_comp.instability_index[2]:.3f}]")
-    print(f"  net_bias    = {r2_comp.net_bias[0]:.3f} "
-          f"[{r2_comp.net_bias[1]:.3f}, {r2_comp.net_bias[2]:.3f}]")
-    print(f"\n  Regime 2 α(L₀={L0_test}) = {r2_comp.alpha_at_L0:.3f}  "
-          f"[true={_sigmoid_scalar(true_a0+true_a1*L0_test):.3f}]")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("pass1", "pass2"):
-        args = _parse_args()
-        print("CLI mode — implement pass1/pass2 handlers as needed")
-    else:
-        _run_selftest()
 
 
 # ===========================================================================
@@ -2054,7 +1087,6 @@ def auto_fit(
     lengths,
     founder_length: float,
     regime1_params: Regime1GlobalParams,
-    regime2_params: Optional["Regime2GlobalParams"] = None,
     haplotype_label: str = "haplotype",
     tail_ratio_threshold: float = 5.0,
     outlier_mad_factor: float = 5.0,
@@ -2069,8 +1101,7 @@ def auto_fit(
 
     This is the recommended entry point for genome-wide use. It:
     1. Runs diagnose_distribution() to assess the data
-    2. If heavy-tailed (tail_ratio > threshold) and regime2_params supplied:
-       routes to fit_locus_r2()
+    2. If heavy-tailed (tail_ratio > threshold)
     3. Otherwise routes to fit_locus_r1(), optionally filtering outliers first
     4. Returns (result, diagnostics) so the routing decision is always visible
 
@@ -2082,9 +1113,6 @@ def auto_fit(
         Germline allele length L₀.
     regime1_params : Regime1GlobalParams
         Required. Regime 1 global parameters.
-    regime2_params : Regime2GlobalParams, optional
-        If supplied and data is heavy-tailed, routes to Regime 2.
-        If None and data is heavy-tailed, still runs Regime 1 with a warning.
     haplotype_label : str
         Label for output.
     tail_ratio_threshold : float
@@ -2097,21 +1125,19 @@ def auto_fit(
     mitotic_generations : float, optional
         G for per-division mutation rates (Regime 1 only).
     **kwargs
-        Additional arguments forwarded to fit_locus_r1 or fit_locus_r2.
+        Additional arguments forwarded to fit_locus_r1.
 
     Returns
     -------
     (result, diagnostics, gof) :
-        result      : Regime1Result or Regime2Result
+        result      : Regime1Result
         diagnostics : DistributionDiagnostics
         gof         : dict or None
             Goodness-of-fit metrics for Regime 1 fits (same keys as
             _compute_gof: ks_statistic, ad_statistic, ppp_variance,
             ppp_skewness, observed_var, fitted_var, dispersion_ratio,
-            chisq_statistic, chisq_pvalue, chisq_df, chisq_n_bins,
-            regime2_recommended, fit_quality, fit_quality_adjusted).
-            None for Regime 2 fits (GoF not meaningful for simulation-based
-            inference) or if GoF computation failed.
+            chisq_statistic, chisq_pvalue, chisq_df, chisq_n_bins, fit_quality,
+            fit_quality_adjusted).
 
     Note: n_ppp (number of PPP simulations, default 300) can be passed
     via **kwargs to control GoF computation speed.
@@ -2125,61 +1151,47 @@ def auto_fit(
     lengths_fit = np.asarray(lengths)
     gof         = None   # populated only for Regime 1 fits
 
-    if diag.is_heavy_tailed and regime2_params is not None:
-        # Route to Regime 2 — GoF not computed (Regime 2 uses simulation-based
-        # inference so the NB-Geometric GoF metrics are not meaningful)
-        result = fit_locus_r2(
-            lengths_fit, founder_length, regime2_params,
-            haplotype_label=haplotype_label, seed=seed, **kwargs
+    # Extract n_ppp before forwarding kwargs to fit_locus_r1
+    # so it does not cause an unexpected keyword argument error
+    n_ppp = kwargs.pop("n_ppp", 300)
+
+    # Optionally filter outliers before Regime 1
+    if filter_outliers_r1 and diag.n_outliers > 0:
+        lengths_fit, removed = filter_outliers(
+            lengths_fit, founder_length, mad_factor=outlier_mad_factor
         )
+        diag.warnings.append(
+            f"Removed {len(removed)} outlier reads before Regime 1 fit: {removed}"
+        )
+
+    result = fit_locus_r1(
+        lengths_fit, founder_length, regime1_params,
+        haplotype_label=haplotype_label,
+        mitotic_generations=mitotic_generations,
+        seed=seed, **kwargs
+    )
+
+    # Goodness-of-fit for Regime 1 fits
+    # n_ppp=0 means skip GoF entirely (useful for speed when not needed)
+    if n_ppp == 0:
+        gof = None
     else:
-        if diag.is_heavy_tailed and regime2_params is None:
-            diag.warnings.append(
-                "Heavy tail detected but no regime2_params supplied. "
-                "Running Regime 1 with adaptive grid — results will underestimate "
-                "instability. Supply regime2_params for correct inference."
+        try:
+            lengths_int = np.round(lengths_fit).astype(int)
+            deltas      = (lengths_int - int(round(result.founder_length))).astype(int)
+            gof = _compute_gof(
+                deltas,
+                r_e = result.r_e[0],
+                r_c = result.r_c[0],
+                pp  = result.p_plus[0],
+                pm  = result.p_minus[0],
+                qe  = regime1_params.q_e,
+                qc  = regime1_params.q_c,
+                n_ppp = n_ppp,
+                seed  = seed + 1,
             )
-        # Extract n_ppp before forwarding kwargs to fit_locus_r1
-        # so it does not cause an unexpected keyword argument error
-        n_ppp = kwargs.pop("n_ppp", 300)
-
-        # Optionally filter outliers before Regime 1
-        if filter_outliers_r1 and diag.n_outliers > 0:
-            lengths_fit, removed = filter_outliers(
-                lengths_fit, founder_length, mad_factor=outlier_mad_factor
-            )
-            diag.warnings.append(
-                f"Removed {len(removed)} outlier reads before Regime 1 fit: {removed}"
-            )
-
-        result = fit_locus_r1(
-            lengths_fit, founder_length, regime1_params,
-            haplotype_label=haplotype_label,
-            mitotic_generations=mitotic_generations,
-            seed=seed, **kwargs
-        )
-
-        # Goodness-of-fit for Regime 1 fits
-        # n_ppp=0 means skip GoF entirely (useful for speed when not needed)
-        if n_ppp == 0:
-            gof = None
-        else:
-            try:
-                lengths_int = np.round(lengths_fit).astype(int)
-                deltas      = (lengths_int - int(round(result.founder_length))).astype(int)
-                gof = _compute_gof(
-                    deltas,
-                    r_e = result.r_e[0],
-                    r_c = result.r_c[0],
-                    pp  = result.p_plus[0],
-                    pm  = result.p_minus[0],
-                    qe  = regime1_params.q_e,
-                    qc  = regime1_params.q_c,
-                    n_ppp = n_ppp,
-                    seed  = seed + 1,
-                )
-            except Exception as e:
-                diag.warnings.append(f"GoF computation failed: {e}")
+        except Exception as e:
+            diag.warnings.append(f"GoF computation failed: {e}")
 
     return result, diag, gof
 
@@ -2287,11 +1299,6 @@ def _compute_gof(
         Values >> 1.0 = model underdispersed (Regime 2 needed).
         Values << 1.0 = model overdispersed (unlikely with NB-Geometric).
 
-    regime2_recommended : bool
-        True if ad_statistic > 100 OR ppp_variance < 0.05 OR
-        dispersion_ratio > 3.0 OR chisq_pvalue < 0.05. Composite flag
-        combining the most sensitive indicators of Regime 1 failure.
-
     chisq_statistic : float
         Pearson Chi-Square statistic computed over quantile-based bins of
         the fitted distribution. Bins are defined by equal-probability
@@ -2336,7 +1343,6 @@ def _compute_gof(
             "chisq_pvalue":        float("nan"),
             "chisq_df":            0,
             "chisq_n_bins":        0,
-            "regime2_recommended": 0,
             "fit_quality":         float("nan"),
             "fit_quality_adjusted":float("nan"),
         }
@@ -2507,24 +1513,15 @@ def _compute_gof(
                         1 - stats.chi2.cdf(chisq_stat, chisq_df)
                     )
 
-    # Chi-square contributes to regime2 flag only when:
-    #   (a) the test is reliable (df >= 2, bins >= 3), AND
-    #   (b) the data is UNDERdispersed relative to the model (disp_ratio > 1)
     # When the model is OVERdispersed (disp_ratio < 1), chi-square misfit
     # means the global step-size priors are too loose for this locus -- a
-    # calibration issue, not a Regime 2 indication.
+    # calibration issue.
     chisq_flag = (
         not np.isnan(chisq_pval) and
         chisq_df >= 2               and
         chisq_bins >= 3             and
         chisq_pval < 0.05           and
         disp_ratio > 1.0               # only flag underdispersed model
-    )
-    regime2_flag = (
-        ad_stat    > 100.0 or
-        ppp_var    < 0.05  or
-        disp_ratio > 3.0   or
-        chisq_flag
     )
 
     # ── Asymmetric fit quality score ─────────────────────────────────────
@@ -2558,7 +1555,7 @@ def _compute_gof(
 
     # Chi-square adjusted score: only penalise when underdispersed and
     # chi-square is reliable (df >= 2, bins >= 3).
-    # Overdispersed chi-square misfit is a calibration issue, not Regime 2.
+    # Overdispersed chi-square misfit is a calibration issue.
     if (not np.isnan(chisq_pval) and
             chisq_df >= 2 and chisq_bins >= 3 and
             chisq_pval < 0.05 and ppp_var < 0.5):
@@ -2578,7 +1575,6 @@ def _compute_gof(
         "chisq_pvalue":         round(chisq_pval, 6) if not np.isnan(chisq_pval) else float('nan'),
         "chisq_df":             chisq_df,
         "chisq_n_bins":         chisq_bins,
-        "regime2_recommended":  int(regime2_flag),
         "fit_quality":          round(fit_quality, 4),
         "fit_quality_adjusted": round(fq_adj,       4),
     }
@@ -2640,8 +1636,8 @@ def analyse_genome_wide(
         Increase to 1000+ for publication-quality GoF estimates.
 
     tail_ratio_threshold : float
-        max|Δ|/std(Δ) above which a haplotype is flagged as heavy-tailed
-        and Regime 2 is recommended. Default 5.0.
+        max|Δ|/std(Δ) above which a haplotype is flagged as heavy-tailed.
+        Default 5.0.
 
     min_reads : int
         Minimum reads per haplotype to attempt fitting. Haplotypes with
@@ -2652,7 +1648,7 @@ def analyse_genome_wide(
         reproducibility without correlation between loci.
 
     verbose : bool
-        Print progress (locus count, warnings for Regime 2 loci).
+        Print progress (locus count).
 
     Returns
     -------
@@ -2662,7 +1658,6 @@ def analyse_genome_wide(
     """
     results = []
     n_loci  = len(data)
-    n_r2_flagged = 0
 
     for i, (locus_id, haplotypes) in enumerate(data.items()):
         t0     = time.time()
@@ -2741,9 +1736,6 @@ def analyse_genome_wide(
                 if j == 0: h1_result=result; h1_gof=gof; h1_diag=diag
                 else:       h2_result=result; h2_gof=gof; h2_diag=diag
 
-                if gof.get("regime2_recommended") and verbose:
-                    n_r2_flagged += 1
-
             except Exception as e:
                 err = str(e)
                 if j == 0: h1_error=err; h1_diag=diag
@@ -2763,12 +1755,10 @@ def analyse_genome_wide(
         ))
 
         if verbose and (i + 1) % 100 == 0:
-            print(f"  Processed {i+1}/{n_loci} loci "
-                  f"({n_r2_flagged} flagged for Regime 2)...")
+            print(f"  Processed {i+1}/{n_loci} loci...")
 
     if verbose:
-        print(f"Done. {n_loci} loci processed, "
-              f"{n_r2_flagged} haplotypes flagged for Regime 2.")
+        print(f"Done. {n_loci} loci processed.")
 
     return results
 
@@ -2811,7 +1801,7 @@ def write_tsv(
     -- Goodness of fit --
     gof_ks_statistic, gof_ad_statistic,
     gof_ppp_variance, gof_ppp_skewness,
-    gof_dispersion_ratio, gof_regime2_recommended,
+    gof_dispersion_ratio,
     -- Diagnostics --
     diag_tail_ratio, diag_skewness, diag_n_outliers, diag_is_heavy_tailed,
     -- Metadata --
@@ -2854,7 +1844,6 @@ def write_tsv(
         "gof_dispersion_ratio",
         "gof_chisq_statistic","gof_chisq_pvalue",
         "gof_chisq_df","gof_chisq_n_bins",
-        "gof_regime2_recommended",
         "diag_tail_ratio","diag_skewness","diag_n_outliers","diag_is_heavy_tailed",
         "diag_recommended_regime",
         "elapsed_s","error",
@@ -2896,7 +1885,7 @@ def analyse_haplotype(
 
     The simplest entry point — takes a list of allele lengths and the
     founder length, returns a flat dict of all results including
-    goodness-of-fit metrics and a regime2 recommendation flag.
+    goodness-of-fit metrics.
 
     Parameters
     ----------
@@ -2933,7 +1922,7 @@ def analyse_haplotype(
         Simulations for the posterior predictive p-value (default 300).
         Set to 0 to skip goodness-of-fit computation entirely (faster).
     tail_ratio_threshold : float
-        max|Δ|/std(Δ) above which Regime 2 is recommended (default 5.0).
+        max|Δ|/std(Δ) above which a haplotype is flagged as heavy-tailed (default 5.0).
     seed : int
         RNG seed for reproducibility.
 
@@ -2975,10 +1964,9 @@ def analyse_haplotype(
         gof_ppp_variance      — P(simulated var ≥ observed var); near 0 = bad fit
         gof_ppp_skewness      — P(simulated skew ≥ observed skew)
         gof_dispersion_ratio  — observed_var / fitted_var; near 1 = good fit
-        gof_regime2_recommended — 1 if model fit is poor and Regime 2 is needed
 
     Diagnostics
-        diag_tail_ratio         — max|Δ|/std(Δ); > 5 suggests Regime 2
+        diag_tail_ratio         — max|Δ|/std(Δ); > 5 suggests
         diag_skewness           — skewness of the Δ distribution
         diag_n_outliers         — reads flagged as potential outliers
         diag_is_heavy_tailed    — 1 if tail_ratio > threshold
@@ -3002,8 +1990,6 @@ def analyse_haplotype(
         )
 
     Checking fit quality before trusting results:
-        if result['gof_regime2_recommended']:
-            print('WARNING: poor Regime 1 fit — consider Regime 2')
         elif result['gof_ppp_variance'] > 0.1:
             print('Acceptable fit')
         else:
