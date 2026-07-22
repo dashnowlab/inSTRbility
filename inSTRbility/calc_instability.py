@@ -377,14 +377,14 @@ if __name__ == "__main__":
     print("\nPhase 1: Regime 1 global param estimation...", file=sys.stderr)
     gp_map = run_r1_pass1(catalog, min_reads=args.min_reads)
 
-    rec = suggest_grid_ceiling(catalog, gp_map, percentile=99, margin=1.5)
-    for label in rec:
-        print(label)
-        for stratum in rec[label]:
-            print(f"  Stratum: {stratum}")
-            for key in sorted(list(rec[label][stratum].keys())):
-                print(f"    {key}:\t{rec[label][stratum][key]}")
-    sys.exit(1)
+    # rec = suggest_grid_ceiling(catalog, gp_map, percentile=99, margin=1.5)
+    # for label in rec:
+    #     print(label)
+    #     for stratum in rec[label]:
+    #         print(f"  Stratum: {stratum}")
+    #         for key in sorted(list(rec[label][stratum].keys())):
+    #             print(f"    {key}:\t{rec[label][stratum][key]}")
+    # sys.exit(1)
 
     # ── Phase 2 ─────────────────────────────────────────────────────────────
     print("\nPhase 2: Regime 1 per-locus inference...", file=sys.stderr)
