@@ -2,7 +2,6 @@ import pysam
 from filelock import FileLock
 import sys
 import os
-import errno
 
 
 def safe_tabix_compress(in_bed, out_bgz, force=False):

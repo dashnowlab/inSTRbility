@@ -23,3 +23,28 @@ $ python ./inSTRbility/core.py -h
 ```bash
 $ python ./inSTRbility/core.py -ref [fasta] -bed [regions_file] -bam [aln_file] -o [output_file] --reads-out
 ```
+
+### Scripts for extracting reads
+- __init__.py
+- core.py
+- cigar_utils.py
+- cstag_utils.py
+- md_utils.py
+- genotype_utils.py
+- cigar_utils.py
+- phasing_utils.py
+- instabillity_utils.py
+- process_reads.py
+- locus_utils.py
+- operation_utils.py
+- version.py
+
+### Scripts for modelling instability
+- calc_instability.py
+- parse_inputs.py
+- suggest_re_rc_grid.py
+- nbgeom_modelling.py
+- compress_bed.py
+- calibrate.py
+- check_lock.py
+- multisample-analysis.py

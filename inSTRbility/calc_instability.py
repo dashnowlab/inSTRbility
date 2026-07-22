@@ -191,7 +191,7 @@ def _build_pass1_data(catalog: list, min_reads: int = 10) -> list:
 def run_r1_pass1(catalog: list, min_reads: int = 10) -> dict:
     """
     Regime 1 Pass 1: estimate global step-size params, stratified by motif.
-    
+
     @param catalog list of locus dicts from parse_input_tsv()
     @param min_reads minimum reads per haplotype to include in Phase 1
     @return dict of {stratum: Regime1GlobalParams}
@@ -228,7 +228,7 @@ def _r1_worker(chunk: list,
                n_ppp: int) -> None:
     """
     Process a chunk of loci with R1 and write TSV rows.
-    
+
     @param chunk list of locus dicts
     @param gp_map dict of {stratum: Regime1GlobalParams}
     @param fout output TSV file
@@ -321,7 +321,7 @@ def _run_r1(catalog: list,
             pbar):
     """
     Run Regime 1 per-locus inference in parallel and write TSV output.
-    
+
     @param catalog list of locus dicts
     @param gp_map dict of {stratum: Regime1GlobalParams}
     @param fout output TSV file
