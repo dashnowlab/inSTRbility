@@ -48,6 +48,7 @@ from src.model.nbgeom_modelling   import (auto_fit, estimate_nbgeom_global, NBGe
 from src.model.parse_inputs       import parse_input_tsv, load_genotypes_from_vcf
 from src.model.calibrate          import recalibrate, recalibrate_distinct
 from src.model.suggest_re_rc_grid import suggest_grid_ceiling
+from src.model.utils              import get_stratum, stratum_labels
 
 
 # ---------------------------------------------------------------------------
@@ -75,24 +76,12 @@ def model_parser(subparsers) -> argparse.Namespace:
 
     p.add_argument("--calibrate-min-reads", type=int, default=20,   help="Min reads per locus for calibration (default: 20)")
 
-    p.set_defaults(func=_run_model)
+    p.set_defaults(func=run_model)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-def get_stratum(motif_len: int) -> int:
-    """
-    Motif length stratum for global parameter estimation. Returns 3, 6, or 7.
-
-    @param motif_len motif length in bp
-    @return stratum int
-    """
-    if motif_len <= 6:   return motif_len
-    if motif_len <= 20:  return 7
-    else:                return 20  
-
 
 def founder_from_genotypes(genotypes, hap_idx: int, lengths: list) -> float:
     """Return founder length in repeat units from VCF genotypes or modal."""
@@ -183,10 +172,8 @@ def run_pass1(catalog: list, min_reads: int = 10) -> dict:
         strata.setdefault(s, []).append(e)
 
     gp_map: dict = {}
-    labels = {20: ">20 bp", 7: ">7 bp"}
-    for m in range(1, 7): labels[m] = f"{m} bp"
     for s, entries in sorted(strata.items()):
-        print(f"    Stratum {labels[s]}: {len(entries)} haplotype-loci", file=sys.stderr)
+        print(f"    Stratum {stratum_labels.get(s, f'{s}bp')}: {len(entries)} haplotype-loci", file=sys.stderr)
         if len(entries) < 4:
             gp_map[s] = NBGeomGlobalParams.from_defaults(s)
         else:
@@ -332,7 +319,7 @@ def run_r1(catalog: list,
                     pass
 
 
-def _run_model(args):
+def run_model(args):
     """
     Run inSTRbility modelling workflow: Phase 0 → Phase 1 → Phase 2 → Phase 3 recalibration
     """

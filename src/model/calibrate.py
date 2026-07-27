@@ -3,10 +3,7 @@ import csv
 import sys
 import time
 
-def get_stratum(motif_len: int) -> int:
-    if motif_len <= 3:   return 3
-    elif motif_len <= 6: return 6
-    return 7
+from src.model.utils import get_stratum, stratum_labels
 
 """
 calibrate_qe_qc_split.py — Independent q_e / q_c calibration by direction
@@ -276,7 +273,7 @@ def recalibrate(
         print(f"  Calibration: {r1_tsv} not found, skipping.", file=sys.stderr)
         return gp_map
 
-    labels = {3: "1-3bp", 6: "4-6bp", 7: "7+bp"}
+
     new_gp_map = {}
     import copy
 
@@ -286,7 +283,7 @@ def recalibrate(
             continue
         disp_vals = stratum_disp.get(stratum, [])
         if len(disp_vals) < 5:
-            print(f"  Stratum {labels[stratum]}: too few loci ({len(disp_vals)}) "
+            print(f"  Stratum {stratum_labels.get(stratum, f'{stratum}bp')}: too few loci ({len(disp_vals)}) "
                   f"for calibration — keeping q={gp.q_e:.3f}", file=sys.stderr)
             new_gp_map[stratum] = gp
             continue
@@ -301,7 +298,7 @@ def recalibrate(
         new_q        = float(np.clip(1.0 / (1.0 + new_rate), 0.05, 0.99))
 
         direction = ("overpredicts" if median_dr < 1 else "underpredicts")
-        print(f"  Stratum {labels[stratum]} (n={len(disp_vals)}): "
+        print(f"  Stratum {stratum_labels.get(stratum, f'{stratum}bp')} (n={len(disp_vals)}): "
               f"median disp_ratio={median_dr:.3f} — model {direction} variance "
               f"→ q: {gp.q_e:.3f} → {new_q:.3f}", file=sys.stderr)
 
