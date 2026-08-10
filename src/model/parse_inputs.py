@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import numpy as np
 
 import sys
 import gzip
@@ -39,32 +40,44 @@ def parse_input_tsv( input_path: str, genotypes:  dict | None) -> list:
         @param haps      dict of {hap: [lengths_ru]} for the current locus
         @param genotypes dict of {locus_key: [allele_hap0, allele_hap1]} from VCF
         """
+
+        genotypes = (genotypes.get(key) if genotypes else None)
+        if genotypes is None:
+            genotypes = [None] * len(haps)
+            for i, hap in enumerate(sorted(list(haps.keys()))):
+                val, count = np.unique(haps[hap], return_counts=True)
+                genotypes[i] = val[np.argmax(count)]
+        if len(haps) == 1 and "founder_length" in info[key]:
+            genotypes[0] = info[key]["founder_length"]
         data.append({
             "chrom":      info[key]["chrom"],
             "start":      info[key]["start"],
             "end":        info[key]["end"],
             "motif":      info[key]["motif"],
+            "founder_length": info[key]["founder_length"] if "founder_length" in info[key] else None,
             "haplotypes": dict(haps),
-            "genotypes":  (genotypes.get(key) if genotypes else None),
+            "genotypes":  genotypes,
         })
 
     for line in ins:
         if line.startswith("#"): continue
 
         fields = line.rstrip("\n").split("\t")
-        (chrom, start, end, motif, read_id, haplotype, length_bp, allele, avg_meth, meth_bases) = fields
+        (chrom, start, end, motif, read_id, founder_length, haplotype, length_bp, allele, avg_meth, meth_bases) = fields
 
         start         = int(start)
         end           = int(end)
         ml            = len(motif)
         ref_length_bp = (end - start)
         pbar.update(1)
+        founder_length = float(founder_length)
 
         key = f"{chrom}:{start}-{end}_{motif}"
-        info.setdefault(key, {"chrom": chrom, "start": start, "end": end, "motif": motif})
+        info.setdefault(key, {"chrom": chrom, "start": start, "end": end, "motif": motif, "founder_length": founder_length})
 
         hap   = int(haplotype)
         units = float(length_bp) / ml
+        units = float(length_bp)
 
         if key != prev_key and prev_key is not None:
             _flush(data, info, prev_key, haps, genotypes)

@@ -3,7 +3,7 @@ import csv
 import sys
 import time
 
-from src.model.utils import get_stratum, stratum_labels
+from src.model.utils import get_stratum, STRATUM_LABELS
 
 """
 calibrate_qe_qc_split.py — Independent q_e / q_c calibration by direction
@@ -28,7 +28,7 @@ per-locus reads (the same `loci_data` structure fed to
 estimate_regime1_global), so it can compute observed variance separately
 for the positive and negative subsets of each locus's Delta values.
 
-The fitted r_e, r_c, p_plus, p_minus (used to compute each direction's
+The fitted r_e, r_c, p_e, p_c (used to compute each direction's
 FITTED variance for comparison) still come from the results TSV, since
 those are the actual per-locus point estimates from Pass 2 -- no need to
 refit anything.
@@ -69,49 +69,24 @@ def _read_results_tsv(results_tsv: str) -> dict:
         return {k: np.array(v) for k, v in out.items()}
 
 
-def recalibrate_distinct(
-    results_tsv: str,
-    loci_data: list[dict],
-    base_params,                       # Regime1GlobalParams
-    min_reads: int = 20,
-    min_reads_per_direction: int = 8,
-    target_percentile: float = 50,
-    verbose: bool = True,
-):
+def recalibrate_distinct(results_tsv, loci_data, base_params, min_reads=20, min_reads_per_direction=8,
+                         target_percentile=50, verbose=True):
     """
     Calibrate q_e and q_c independently, using each locus's expansion-only
     and contraction-only reads separately.
 
-    Parameters
-    ----------
-    results_tsv : str
-        Path to the TSV from write_tsv()/analyse_genome_wide(). Must contain
-        'haplotype_label', 'n_reads', 'r_e', 'r_c', 'p_plus', 'p_minus'.
-    loci_data : list of dicts, each with:
-        'haplotype_label' : str   -- must match a row in results_tsv
-        'deltas'          : array -- raw per-read Delta_i = observed - founder
-        (same structure as estimate_regime1_global's input, plus the label)
-    base_params : Regime1GlobalParams
-        Starting parameters. p_plus/p_minus/r are untouched; only q_e, q_c
-        are adjusted, independently.
-    min_reads : int
-        Minimum total reads at a locus to consider it at all (default 20).
-    min_reads_per_direction : int
-        Minimum reads on ONE side (expansion or contraction) to include
-        that side's variance in that direction's calibration (default 8).
-        This is deliberately independent per direction -- a locus can
-        contribute to the q_e calibration without qualifying for q_c, and
-        vice versa, since one direction is very commonly much rarer than
-        the other.
-    target_percentile : float
-        Percentile of the ratio distribution to use (default 50 = median).
-
-    Returns
-    -------
-    A copy of base_params with q_e and q_c independently recalibrated.
+    @param results_tsv  TSV from Phase 2 output (must contain r_e, r_c, p_e, p_c)
+    @param loci_data    list of dicts, each with 'haplotype_label' and 'deltas' (raw per-read Delta_i = observed - founder)
+    @param base_params  Regime1GlobalParams object with starting q_e and q_c
+    @param min_reads  Minimum total reads at a locus to consider it at all (default 20)
+    @param min_reads_per_direction  Minimum reads on ONE side (expansion or contraction) to include that side's variance in that direction's calibration (default 8)
+    @param target_percentile  Percentile of the ratio distribution to use (default 50 = median)
+    @param verbose  If True, print calibration summary to stderr (default True)
+    @return  New Regime1GlobalParams object with calibrated q_e and q_c
     """
+
     results = _read_results_tsv(results_tsv)
-    required = ["haplotype", "n_reads", "r_e", "r_c", "p_plus", "p_minus"]
+    required = ["haplotype", "n_reads", "r_e", "r_c", "p_e", "p_c"]
     missing = [c for c in required if c not in results]
     if missing:
         raise ValueError(f"results_tsv is missing required columns: {missing}")
@@ -122,8 +97,8 @@ def recalibrate_distinct(
             "n_reads": float(results["n_reads"][i]),
             "r_e": float(results["r_e"][i]),
             "r_c": float(results["r_c"][i]),
-            "p_plus": float(results["p_plus"][i]),
-            "p_minus": float(results["p_minus"][i]),
+            "p_e": float(results["p_e"][i]),
+            "p_c": float(results["p_c"][i]),
         }
 
     qe0, qc0 = base_params.q_e, base_params.q_c
@@ -140,15 +115,15 @@ def recalibrate_distinct(
         pos = deltas[deltas > 0]
         neg = -deltas[deltas < 0]
 
-        r_e, p_plus = row["r_e"], row["p_plus"]
-        r_c, p_minus = row["r_c"], row["p_minus"]
+        r_e, p_e = row["r_e"], row["p_e"]
+        r_c, p_c = row["r_c"], row["p_c"]
 
         # Expansion side
         if len(pos) >= min_reads_per_direction:
             obs_var_e = float(pos.var())
             mu_Ne  = r_e * (1 - qe0) / qe0
             var_Ne = r_e * (1 - qe0) / qe0**2
-            fitted_var_e = mu_Ne * (1 - p_plus) / p_plus**2 + var_Ne / p_plus**2
+            fitted_var_e = mu_Ne * (1 - p_e) / p_e**2 + var_Ne / p_e**2
             if fitted_var_e > 0 and np.isfinite(obs_var_e):
                 ratios_e.append(obs_var_e / fitted_var_e)
                 n_loci_e += 1
@@ -158,7 +133,7 @@ def recalibrate_distinct(
             obs_var_c = float(neg.var())
             mu_Nc  = r_c * (1 - qc0) / qc0
             var_Nc = r_c * (1 - qc0) / qc0**2
-            fitted_var_c = mu_Nc * (1 - p_minus) / p_minus**2 + var_Nc / p_minus**2
+            fitted_var_c = mu_Nc * (1 - p_c) / p_c**2 + var_Nc / p_c**2
             if fitted_var_c > 0 and np.isfinite(obs_var_c):
                 ratios_c.append(obs_var_c / fitted_var_c)
                 n_loci_c += 1
@@ -283,7 +258,7 @@ def recalibrate(
             continue
         disp_vals = stratum_disp.get(stratum, [])
         if len(disp_vals) < 5:
-            print(f"  Stratum {stratum_labels.get(stratum, f'{stratum}bp')}: too few loci ({len(disp_vals)}) "
+            print(f"  Stratum {STRATUM_LABELS.get(stratum, f'{stratum}bp')}: too few loci ({len(disp_vals)}) "
                   f"for calibration — keeping q={gp.q_e:.3f}", file=sys.stderr)
             new_gp_map[stratum] = gp
             continue
@@ -298,7 +273,7 @@ def recalibrate(
         new_q        = float(np.clip(1.0 / (1.0 + new_rate), 0.05, 0.99))
 
         direction = ("overpredicts" if median_dr < 1 else "underpredicts")
-        print(f"  Stratum {stratum_labels.get(stratum, f'{stratum}bp')} (n={len(disp_vals)}): "
+        print(f"  Stratum {STRATUM_LABELS.get(stratum, f'{stratum}bp')} (n={len(disp_vals)}): "
               f"median disp_ratio={median_dr:.3f} — model {direction} variance "
               f"→ q: {gp.q_e:.3f} → {new_q:.3f}", file=sys.stderr)
 

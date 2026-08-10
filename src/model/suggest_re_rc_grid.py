@@ -42,15 +42,11 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 
+from src.model.utils import get_stratum
 
 def _K(p: float, q: float) -> float:
     """Closed form: Var(sum of geometric steps over NB(r,q) events) = r * K(p,q)."""
     return (1 - q) / (p**2 * q**2) * ((1 - p) * q + 1)
-
-def get_stratum(motif_len: int) -> int:
-    if motif_len <= 3:   return 3
-    elif motif_len <= 6: return 6
-    return 7
 
 
 def plot_histogram(data, name='default.png'):
@@ -125,16 +121,21 @@ def suggest_grid_ceiling(
 
     r_e_estimates, r_c_estimates = {}, {}
 
+    L0 = None
+
     for locus in loci_data:
         ml = len(locus['motif'])
         stratum = get_stratum(ml)
         gp = global_params[stratum]
-        stratum = ml if ml <= 6 else 7
+        stratum = get_stratum(ml)
         if stratum not in r_e_estimates: r_e_estimates[stratum] = []
         if stratum not in r_c_estimates: r_c_estimates[stratum] = []
         for h,hap in enumerate(sorted(list(locus["haplotypes"].keys()))):
             lengths = np.asarray(locus["haplotypes"][hap], dtype=float)
-            L0 = locus["genotypes"][h]
+            if locus["genotypes"] is None or locus["genotypes"][h] is None:
+                values, counts = np.unique(lengths, return_counts=True)
+                L0 = values[np.argmax(counts)]
+            else: L0 = locus["genotypes"][h]
             deltas = np.round(lengths).astype(int) - int(round(L0))
  
             pos = deltas[deltas > 0]
@@ -153,8 +154,6 @@ def suggest_grid_ceiling(
                 if r_e_hat > 100:
                     f = round(locus["genotypes"][h], 3)
                     l = [round(x, 3) for x in locus["haplotypes"][hap] if round(x, 3) != f]
-                    print(locus['chrom'], locus['start'], locus['end'], locus['motif'], f, sep='\t')
-                    print('  ', sorted(l))
                 if np.isfinite(r_e_hat) and r_e_hat > 0:
                     r_e_estimates[stratum].append(r_e_hat)
     

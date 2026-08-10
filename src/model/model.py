@@ -6,32 +6,6 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-"""
-Somatic Tandem-Repeat Instability Analysis
-===================================================================
-
-MODEL:  NB-Geometric compound model (nbgeom_modelling.py)
-        Fast, age-free, FFT-exact. Covers >95 % of WGS loci.
-
-Workflow
-------------------
-  Phase 0  Parse TSV reads + VCF genotypes
-  Phase 1  Regime 1 Pass 1  — estimate global step-size params
-  Phase 2  Regime 1 Pass 2  — per-locus inference  (parallelised)
-  Phase 3  Recalibrate      — recalibrate parameters from results
-
-Usage
------
-  # Regime 1 only
-  python model.py -i reads.tsv -v genotypes.vcf -o out.tsv -t 8
-
-Input TSV (one row per read, tab-separated):
-  chrom  start  end  motif  read_id  haplotype  length_bp  allele  avg_meth  meth_bases
-
-VCF (optional):
-  FORMAT/AL field in base pairs; divided internally by motif length.
-  If absent, modal observed length is used as the founder allele.
-"""
 
 import argparse
 import sys
@@ -48,12 +22,9 @@ from src.model.nbgeom_modelling   import (auto_fit, estimate_nbgeom_global, NBGe
 from src.model.parse_inputs       import parse_input_tsv, load_genotypes_from_vcf
 from src.model.calibrate          import recalibrate, recalibrate_distinct
 from src.model.suggest_re_rc_grid import suggest_grid_ceiling
-from src.model.utils              import get_stratum, stratum_labels
+from src.model.utils              import get_stratum, STRATUM_LABELS
+from src.model.write              import OUT_COLS
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def model_parser(subparsers) -> argparse.Namespace:
     p = subparsers.add_parser(
@@ -79,12 +50,15 @@ def model_parser(subparsers) -> argparse.Namespace:
     p.set_defaults(func=run_model)
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def founder_from_genotypes(genotypes, hap_idx: int, lengths: list) -> float:
-    """Return founder length in repeat units from VCF genotypes or modal."""
+def founder_from_genotypes(genotypes, hap_idx, lengths):
+    """
+    Return founder length in repeat units from VCF genotypes or modal.
+    
+    @param genotypes list of founder lengths (bp) from VCF, or None
+    @param hap_idx index of haplotype to use
+    @param lengths list of observed lengths (repeat units) for this haplotype
+    @return founder length in repeat units (float)
+    """
     try:
         return float(genotypes[hap_idx])
     except (IndexError, TypeError, ValueError):
@@ -93,37 +67,7 @@ def founder_from_genotypes(genotypes, hap_idx: int, lengths: list) -> float:
         return float(v[np.argmax(c)])
 
 
-# ---------------------------------------------------------------------------
-# Output column definitions
-# ---------------------------------------------------------------------------
-
-OUT_COLS = [
-    # Locus identity
-    "chrom", "start", "end", "motif", "haplotype", "regime",
-    # Allele summary
-    "founder_length", "founder_length_bp",
-    "avg_deviation", "winsorized_mean_abs_delta", "n_reads",
-    # NB-Geometric posteriors (posterior mean only)
-    "r_e", "r_c", "p_plus", "p_minus",
-    "mu_expansion", "mu_contraction",
-    # Instability indices
-    "instability_index", "net_bias", "p_expansion",
-    "expansion_rate", "contraction_rate",
-    "net_mutation_rate", "p_any_mutation",
-    # Regime 1 GoF
-    "gof_ks_stat", "gof_ad_stat", "gof_ppp_var",
-    "gof_ppp_skewness", "gof_observed_var", "gof_fitted_var",
-    "gof_dispersion_ratio", "gof_chisq_stat", "gof_chisq_p",
-    "gof_chisq_df", "gof_chisq_n_bins", "gof_fit_quality", "gof_fit_quality_adj",
-    "elapsed_s",
-]
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — Regime 1 global parameter estimation
-# ---------------------------------------------------------------------------
-
-def build_pass1_data(catalog: list, min_reads: int = 10) -> list:
+def build_pass1_data(catalog, min_reads=10):
     """
     Build a list of per-haplotype-locus dicts for Phase 1 global parameter estimation.
     Each dict: {deltas, founder_length, locus_id, haplotype, motif_length}
@@ -146,7 +90,7 @@ def build_pass1_data(catalog: list, min_reads: int = 10) -> list:
             out.append({
                 "deltas":         (np.round(arr) - round(founder_length)).astype(int),
                 "founder_length": founder_length,
-                "locus_id":       f"{locus['chrom']}_{locus['start']}",
+                "locus_id":       f"{locus['chrom']}-{locus['start']}-{locus['end']}_{locus['motif']}",
                 "haplotype":      hap,
                 "motif_length":   ml,
             })
@@ -154,7 +98,7 @@ def build_pass1_data(catalog: list, min_reads: int = 10) -> list:
     return out
 
 
-def run_pass1(catalog: list, min_reads: int = 10) -> dict:
+def run_pass1(catalog, min_reads = 10):
     """
     Pass 1: estimate global step-size params, stratified by motif.
 
@@ -166,14 +110,14 @@ def run_pass1(catalog: list, min_reads: int = 10) -> dict:
     loci_data = build_pass1_data(catalog, min_reads)
     print(f"  R1 Pass 1: {len(loci_data)} haplotype-loci", file=sys.stderr)
 
-    strata: dict = {}
-    for e in loci_data:
-        s = get_stratum(e["motif_length"])
-        strata.setdefault(s, []).append(e)
+    strata = {}
+    for locus in loci_data:
+        s = get_stratum(locus["motif_length"])
+        strata.setdefault(s, []).append(locus)
 
-    gp_map: dict = {}
+    gp_map = {}
     for s, entries in sorted(strata.items()):
-        print(f"    Stratum {stratum_labels.get(s, f'{s}bp')}: {len(entries)} haplotype-loci", file=sys.stderr)
+        print(f"    Stratum {STRATUM_LABELS.get(s, f'{s}bp')}: {len(entries)} haplotype-loci", file=sys.stderr)
         if len(entries) < 4:
             gp_map[s] = NBGeomGlobalParams.from_defaults(s)
         else:
@@ -182,11 +126,7 @@ def run_pass1(catalog: list, min_reads: int = 10) -> dict:
     return gp_map
 
 
-# ---------------------------------------------------------------------------
-# Phase 2 — Regime 1 per-locus worker
-# ---------------------------------------------------------------------------
-
-def r1_worker(chunk: list, gp_map: dict, fout: str, thread_id: int, n_ppp: int) -> None:
+def r1_worker(chunk, gp_map, fout, thread_id, n_ppp) -> None:
     """
     Process a chunk of loci with R1 and write TSV rows.
 
@@ -221,19 +161,13 @@ def r1_worker(chunk: list, gp_map: dict, fout: str, thread_id: int, n_ppp: int) 
             t0      = time.time()
             founder = founder_from_genotypes(gt, hap_idx, lengths)
 
-            try:
-                result, diag, gof = auto_fit(
-                    lengths,
-                    founder_length  = founder,
-                    nbgeom_params  = gp,
-                    haplotype_label = f"hap{hap}",
-                    n_ppp           = n_ppp,
-                )
+            # try:
+            result, gof = auto_fit(ml, lengths, founder, gp, n_ppp=n_ppp)
 
-            except Exception as e:
-                print(f"WARN R1 {chrom}:{start} hap{hap}: {e}",
-                      file=sys.stderr)
-                continue
+            # except Exception as e:
+            #     print(f"WARN R1 {chrom}:{start} hap{hap}: {e}",
+            #           file=sys.stderr)
+            #     continue
 
             if gof is None:
                 gof = dict(null_gof)
@@ -241,14 +175,16 @@ def r1_worker(chunk: list, gp_map: dict, fout: str, thread_id: int, n_ppp: int) 
             avg   = float(np.mean(np.abs(np.asarray(lengths, float) - result.founder_length)))
 
             row = [
-                chrom, start, end, motif, hap, "R1",
+                chrom, start, end, motif, hap,
                 round(result.founder_length, 4),
                 round(result.founder_length * ml, 1),
                 result.n_reads,
                 round(result.r_e[0],            4),
                 round(result.r_c[0],            4),
-                round(result.p_plus[0],         4),
-                round(result.p_minus[0],        4),
+                round(result.q_e,   4),
+                round(result.q_c, 4),
+                round(result.p_e[0],         4),
+                round(result.p_c[0],        4),
                 round(result.mu_expansion[0],   4),
                 round(result.mu_contraction[0], 4),
                 round(result.instability_index[0], 4),
@@ -272,12 +208,7 @@ def r1_worker(chunk: list, gp_map: dict, fout: str, thread_id: int, n_ppp: int) 
     out.close()
 
 
-def run_r1(catalog: list,
-            gp_map:  dict,
-            fout:    str,
-            threads: int,
-            n_ppp:   int,
-            pbar):
+def run_r1(catalog, gp_map, fout, threads, n_ppp, pbar):
     """
     Run Regime 1 per-locus inference in parallel and write TSV output.
 
@@ -344,12 +275,22 @@ def run_model(args):
 
     # rec = suggest_grid_ceiling(catalog, gp_map, percentile=99, margin=1.5)
     # for label in rec:
-    #     print(label)
     #     for stratum in rec[label]:
-    #         print(f"  Stratum: {stratum}")
-    #         for key in sorted(list(rec[label][stratum].keys())):
-    #             print(f"    {key}:\t{rec[label][stratum][key]}")
-    # sys.exit(1)
+    #         n = 0
+    #         if rec[label][stratum]["suggested_ceiling"] > 25: n = 100
+    #         elif rec[label][stratum]["suggested_ceiling"] > 10: n = 100
+    #         elif rec[label][stratum]["suggested_ceiling"] > 0: n = 100
+    #         print(label, stratum, rec[label][stratum]["suggested_ceiling"], n, sep="\t")
+    #         if label == "r_e":
+    #             RE_GRID[stratum] = np.exp(np.linspace(np.log(0.01), np.log(rec[label][stratum]["suggested_ceiling"]), n))
+    #         else:
+    #             RC_GRID[stratum] = np.exp(np.linspace(np.log(0.01), np.log(rec[label][stratum]["suggested_ceiling"]), n))
+
+    # print("Grids for R1 inference:")
+    # for stratum in sorted(RE_GRID):
+    #     print(f"  Stratum {STRATUM_LABELS.get(stratum, f'{stratum}bp')}: r_e grid = {min(RE_GRID[stratum])} - {max(RE_GRID[stratum])}")
+    # for stratum in sorted(RC_GRID):
+    #     print(f"  Stratum {STRATUM_LABELS.get(stratum, f'{stratum}bp')}: r_c grid = {min(RC_GRID[stratum])} - {max(RC_GRID[stratum])}")
 
     # ── Phase 2 ─────────────────────────────────────────────────────────────
     print("\nPhase 2: Regime 1 per-locus inference...", file=sys.stderr)
