@@ -2,3 +2,6 @@
 /archive/*
 /inSTRbility/__pycache__/*
 .DS_Store
+/src/model/*bak*
+/src/model/__pycache__/*
+/src/extract/__pycache__/*
