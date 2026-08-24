@@ -10,13 +10,12 @@
     y2="10"
     gradientUnits="userSpaceOnUse"
   >
-    <stop offset="0%" stop-color="oklch(65% 0.2 340 / 0)" />
-    <stop offset="50%" stop-color="oklch(65% 0.2 340)" />
-    <stop offset="100%" stop-color="oklch(65% 0.2 30 / 0)" />
+    <stop offset="0%" stop-color="oklch(65% 0.2 240 / 0)" />
+    <stop offset="50%" stop-color="oklch(65% 0.2 240 / 0.15)" />
+    <stop offset="100%" stop-color="oklch(65% 0.2 240 / 0)" />
   </linearGradient>
   <path
     fill="url(#gradient)"
-    opacity="0.15"
     d="
       M -50 15
       C -20 15 -20 -30 0 -30
@@ -30,7 +29,7 @@
   />
   <path
     fill="none"
-    stroke="oklch(25% 0 210)"
+    stroke="oklch(25% 0 300)"
     stroke-width="4"
     d="
       M -50 15
@@ -41,20 +40,20 @@
   />
   <g fill="none" stroke-width="2">
     <path
-      stroke="oklch(65% 0.2 210)"
+      stroke="oklch(65% 0.2 300)"
       stroke-dasharray="1 1 1 1 16"
       pathLength="20"
       d="M -50 25 L -5 25"
     />
-    <path stroke="oklch(65% 0.2 340)" d="M -5 25 A 13 13 0 1 1 5 25" />
+    <path stroke="oklch(65% 0.2 260)" d="M -5 25 A 13 13 0 1 1 5 25" />
     <path
-      stroke="oklch(65% 0.2 30)"
+      stroke="oklch(65% 0.2 200)"
       stroke-dasharray="1 1 1 1 16"
       pathLength="20"
       d="M 50 25 L 5 25"
     />
   </g>
-  <g fill="oklch(65% 0.2 210)">
+  <g fill="oklch(65% 0.2 300)">
     <rect
       x="-37.5"
       y="25"
@@ -80,7 +79,7 @@
       transform="translate(-4, -4)"
     />
   </g>
-  <g fill="oklch(65% 0.2 340)">
+  <g fill="oklch(65% 0.2 260)">
     <rect
       x="-12"
       y="10"
@@ -106,7 +105,7 @@
       transform="translate(-4, -4)"
     />
   </g>
-  <g fill="oklch(65% 0.2 30)">
+  <g fill="oklch(65% 0.2 200)">
     <rect
       x="37.5"
       y="25"
