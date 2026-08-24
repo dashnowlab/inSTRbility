@@ -1,6 +1,6 @@
 # inSTRbility
 
-<img src="./logo/logo.svg" height="200" alt="inSTRbility logo" />
+<img src="./logo/logo.png" height="200" alt="inSTRbility logo" />
 
 inSTRbility is a toolkit to analyse somatic instability at tandem repeat loci from whole genome sequencing datasets.
 
