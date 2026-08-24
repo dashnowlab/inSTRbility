@@ -54,14 +54,14 @@ The input file for the instability calculation is a tab-delimited file with the 
 | chromosome | Chromosome |
 | start | Start position |
 | end | End position |
-| individual | Sample ID |
 | repeat motif | Repeat motif |
 | read_id | Read ID |
+| founder_length | Genotyped length of the repeat. Optional: Can be None |
 | haplotype | Haplotype ID |
-| allele_length | Allele length in the read |
-| sequence | Sequence of the repeat locus in the read. Optional:  |
-| avg_meth | Average methylation in the repeat locus in the read |
-| nmeth_bases | Number of methylated bases in the repeat locus in the read |
+| length | Allele length in the read |
+| sequence | Sequence of the repeat locus in the read. Optional: Can be None |
+| avg_meth | Average methylation in the repeat locus in the read. Optional: Can be None |
+| nmeth_bases | Number of methylated bases in the repeat locus in the read. Optional: Can be None |
 
 
 ## Mutation model for calculating instability
